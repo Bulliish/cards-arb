@@ -1,60 +1,103 @@
 import streamlit as st
-import pandas as pd
-from cards_cert_arbitrage import find_deals_cardshq
+from cards_cert_arbitrage import scan_selected_categories, CARDSHQ_CATEGORY_URLS
 
 st.set_page_config(page_title="PSA Cert Arbitrage Finder", layout="wide")
 
-st.title("🧾 PSA Cert Arbitrage Finder")
+st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
 st.markdown(
-    "Find potentially underpriced PSA-graded cards by scraping shop listings that publish PSA **cert** numbers, "
-    "then comparing to PSA **Auction Prices Realized** (Most Recent by Grade)."
+    "Scans the **exact categories** you provided on CardsHQ, opens each product page, "
+    "extracts **Card Name, Price, PSA Grade, PSA Cert**, looks up the **PSA Sales History** "
+    "price for that grade, and estimates ROI."
+)
+
+st.info(
+    "Heads up: Scraping is throttled to be polite (default ~1.25s/request). "
+    "Large scans can take a bit depending on inventory size."
 )
 
 with st.expander("Settings", expanded=True):
-    col1, col2, col3 = st.columns(3)
-    limit = col1.number_input("Max listings to evaluate", 10, 400, 60, 10)
-    fee_rate = col2.number_input("Selling fee rate (e.g., eBay 13% = 0.13)", 0.00, 0.30, 0.13, 0.01, format="%.2f")
-    ship_out = col3.number_input("Your shipping/fulfillment cost ($)", 0.0, 30.0, 5.0, 0.5)
-
-run = st.button("Run scan (CardsHQ)")
-st.caption("⚠️ Please respect site ToS and robots.txt. Throttling is applied.")
-
-@st.cache_data(show_spinner=False, ttl=60*30)
-def _run(limit, fee_rate, ship_out):
-    return find_deals_cardshq(limit=int(limit), fee_rate=float(fee_rate), ship_out=float(ship_out))
-
-if run:
-    with st.spinner("Scanning CardsHQ and fetching PSA APR…"):
-        df = _run(limit, fee_rate, ship_out)
-
-    if df.empty:
-        st.warning("No PSA-cert listings found in the scanned range.")
-    else:
-        # Show KPIs
-        found = int(df.shape[0])
-        winners = int(df["ROI % (est)"].fillna(-999).gt(0).sum())
-        colA, colB = st.columns(2)
-        colA.metric("Listings evaluated", found)
-        colB.metric("Positive ROI% (est)", winners)
-
-        # Table
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
+    left, right = st.columns([2, 1])
+    with left:
+        chosen = st.multiselect(
+            "Categories to scan",
+            options=list(CARDSHQ_CATEGORY_URLS.keys()),
+            default=list(CARDSHQ_CATEGORY_URLS.keys())
+        )
+        limit = st.number_input(
+            "Max PSA-cert listings per category (0 = no cap)",
+            min_value=0, max_value=1000, value=0, step=25
+        )
+    with right:
+        fee_rate = st.number_input(
+            "Selling fee rate (eBay/marketplace) — e.g. 0.13 = 13%",
+            min_value=0.0, max_value=0.30, value=0.13, step=0.01, format="%.2f"
+        )
+        ship_out = st.number_input(
+            "Your outbound shipping/fulfillment cost ($)",
+            min_value=0.0, max_value=50.0, value=5.0, step=0.5
         )
 
-        # Download
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv, file_name="psa_arbitrage_results.csv", mime="text/csv")
+run = st.button("Run scan")
+st.caption("⚠️ Please respect each website’s Terms and robots.txt. This tool is for your personal research.")
+
+@st.cache_data(show_spinner=False, ttl=60*20)
+def _run(categories, limit, fee_rate, ship_out):
+    lim = None if limit == 0 else int(limit)
+    return scan_selected_categories(
+        categories=categories,
+        limit_per_category=lim,
+        fee_rate=float(fee_rate),
+        ship_out=float(ship_out)
+    )
+
+if run:
+    if not chosen:
+        st.warning("Pick at least one category to scan.")
+    else:
+        with st.spinner("Scanning categories and fetching PSA APR…"):
+            df = _run(chosen, limit, fee_rate, ship_out)
+
+        if df.empty:
+            st.error("No PSA-cert listings found in the scanned categories.")
+        else:
+            # KPIs
+            total_rows = int(df.shape[0])
+            pos_count = int(df["ROI % (est)"].fillna(-999).gt(0).sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Results", f"{total_rows:,}")
+            c2.metric("Positive ROI (est)", f"{pos_count:,}")
+            c3.metric("Categories scanned", f"{len(chosen)}")
+
+            # Display table
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # Download
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download CSV",
+                data=csv,
+                file_name="psa_arbitrage_results.csv",
+                mime="text/csv"
+            )
 
 st.divider()
 st.markdown(
     """
+**Included categories (fixed):**
+- Baseball — `/collections/baseball-cards`  
+- Basketball (Graded) — `/collections/basketball-graded`  
+- Football — `/collections/football-cards`  
+- Soccer — `/collections/soccer-cards`  
+- Pokemon — `/collections/pokemon-cards`  
+
 **Notes**
-- Current adapter targets **cardshq.com** (Shopify) because it prints **PSA Certification #** and Grade in-page.
-- Add more adapters (e.g., Burbank) by writing a parser that extracts **name, price, PSA grade, PSA cert** per product.
-- PSA APR uses the **Most Recent Price** for the exact grade when available.
-- ROI = (APR * (1 - fee) - ship_out - ask) / ask. Tweak fee/ship above.
-    """
+- We paginate each category until no more product links are present.
+- Product pages are parsed for **Certification #** and **Grade** (pattern matches handle common variations).
+- PSA **Most Recent Price** for the scraped grade is used when available; otherwise we show a median of recent sale prices captured from the page.
+- ROI = `(APR * (1 - fee_rate) - ship_out - ask) / ask`.
+"""
 )
