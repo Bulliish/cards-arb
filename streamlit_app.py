@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Tuple, Callable
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3 import Retry
+from urllib3.util.retry import Retry
 from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 import pandas as pd
