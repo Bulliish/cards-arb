@@ -1,25 +1,40 @@
-import os
 import streamlit as st
-from cards_cert_arbitrage import scan_selected_categories, CARDSHQ_CATEGORY_URLS
+from cards_cert_arbitrage import (
+    scan_selected_categories,
+    CARDSHQ_CATEGORY_URLS,
+    test_psa_cert,
+)
 
 st.set_page_config(page_title="PSA Cert Arbitrage Finder — CardsHQ", layout="wide")
 
 st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
 
 st.markdown(
-    "This scans your chosen **CardsHQ** categories, opens each product, extracts "
+    "Scans your chosen **CardsHQ** categories, opens each product, extracts "
     "**Card Name, Price, PSA Grade, PSA Cert**, then fetches PSA **Sales History** for that cert/grade "
     "and estimates ROI after fees & outbound shipping."
 )
 
-st.info(
-    "If you see SSL/handshake errors to PSA on Streamlit Cloud, set a proxy in **Secrets**:\n\n"
-    "- `SCRAPERAPI_KEY: your_key_here`  (ScraperAPI)\n"
-    "- or `ZENROWS_KEY: your_key_here` (ZenRows)\n\n"
-    "The app will automatically retry PSA requests through the proxy when needed."
-)
+with st.expander("Network settings", expanded=True):
+    net_mode = st.radio(
+        "Network mode for all requests (CardsHQ + PSA):",
+        options=["Auto (default)", "Direct only", "Force proxy"],
+        help=(
+            "Auto: try direct HTTPS; on SSL error, retry via proxy if configured.\n"
+            "Direct only: never use proxy.\n"
+            "Force proxy: always proxy (requires SCRAPERAPI_KEY or ZENROWS_KEY in secrets)."
+        ),
+        index=0,
+        horizontal=True
+    )
+    if net_mode == "Auto (default)":
+        force_proxy = None
+    elif net_mode == "Direct only":
+        force_proxy = False
+    else:
+        force_proxy = True
 
-with st.expander("Settings", expanded=True):
+with st.expander("Scan settings", expanded=True):
     left, right = st.columns([2, 1])
     with left:
         chosen = st.multiselect(
@@ -41,17 +56,18 @@ with st.expander("Settings", expanded=True):
             min_value=0.0, max_value=50.0, value=5.0, step=0.5
         )
 
-run = st.button("Run scan")
-st.caption("⚠️ Respect each website’s Terms and robots.txt. This is for personal research.")
+run = st.button("Run category scan")
+st.caption("⚠️ Please respect each website’s Terms and robots.txt. For personal research.")
 
 @st.cache_data(show_spinner=False, ttl=60*20)
-def _run(categories, limit, fee_rate, ship_out):
+def _run(categories, limit, fee_rate, ship_out, force_proxy):
     lim = None if limit == 0 else int(limit)
     return scan_selected_categories(
         categories=categories,
         limit_per_category=lim,
         fee_rate=float(fee_rate),
-        ship_out=float(ship_out)
+        ship_out=float(ship_out),
+        force_proxy=force_proxy
     )
 
 if run:
@@ -60,7 +76,7 @@ if run:
     else:
         with st.spinner("Scanning categories and fetching PSA APR…"):
             try:
-                df = _run(chosen, limit, fee_rate, ship_out)
+                df = _run(chosen, limit, fee_rate, ship_out, force_proxy)
             except Exception as e:
                 st.exception(e)
                 st.stop()
@@ -86,11 +102,53 @@ if run:
             )
 
 st.divider()
+st.header("🔎 Quick PSA Cert Test")
+
+with st.form("psa_test_form", clear_on_submit=False):
+    colA, colB, colC = st.columns([2, 1, 1])
+    cert = colA.text_input("PSA Certification Number", placeholder="e.g., 92911899")
+    grade_opt = colB.text_input("Grade (optional)", placeholder="e.g., 10")
+    submitted = st.form_submit_button("Test cert")
+
+if submitted:
+    if not cert or not cert.isdigit():
+        st.warning("Enter a numeric PSA certification number.")
+    else:
+        try:
+            grade_num = int(grade_opt) if grade_opt.strip() else None
+        except ValueError:
+            st.warning("Grade must be a number (e.g., 9 or 10). Ignoring grade filter.")
+            grade_num = None
+
+        with st.spinner("Fetching PSA Sales History…"):
+            try:
+                data = test_psa_cert(cert.strip(), grade_num=grade_num, force_proxy=force_proxy)
+                st.write(f"**Cert:** {cert}")
+                if data.get("PSA Cert URL"):
+                    st.write(f"[PSA Cert Page]({data['PSA Cert URL']})")
+                if data.get("PSA APR URL"):
+                    st.write(f"[PSA Sales History]({data['PSA APR URL']})")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Most Recent (grade)", f"${data['APR Most Recent (Grade)']:,}" if data["APR Most Recent (Grade)"] else "—")
+                c2.metric("Median Recent (all)", f"${data['APR Median Recent (All)']:,}" if data["APR Median Recent (All)"] else "—")
+                c3.metric("Chosen Value", f"${data['Chosen Value']:,}" if data["Chosen Value"] else "—")
+
+                if force_proxy is True:
+                    st.caption("Proxy mode: **Forced**")
+                elif force_proxy is False:
+                    st.caption("Proxy mode: **Direct only**")
+                else:
+                    st.caption("Proxy mode: **Auto** (direct, fallback to proxy on SSL error if configured)")
+            except Exception as e:
+                st.exception(e)
+
+st.divider()
 st.markdown(
     """
-**How proxy fallback works**
-- The app first tries **direct HTTPS** with a hardened TLS adapter and retries.
-- If it hits an **SSLError** to PSA and you’ve set `SCRAPERAPI_KEY` or `ZENROWS_KEY` in Streamlit **Secrets**, it automatically retries through that provider.
-- No proxy keys? It will stay on direct mode and surface the SSL error (good for debugging).
+**Network modes**
+- **Auto (default)**: direct HTTPS first; on SSL error, retries via proxy if `SCRAPERAPI_KEY` or `ZENROWS_KEY` is set.
+- **Direct only**: never uses proxy (handy for local runs).
+- **Force proxy**: always uses proxy (requires a key in app secrets).
 """
 )
