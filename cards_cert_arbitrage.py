@@ -168,4 +168,248 @@ def _grade_num_from_text(grade_text: Optional[str]) -> Optional[int]:
     if not grade_text:
         return None
     m = re.search(r'(\d{1,2})', grade_text)
-    return int(m.gr
+    return int(m.group(1)) if m else None
+
+# ---------------- Category crawler ----------------
+def _discover_product_urls_for_category(category_url_first_page: str, max_pages: int = 200, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> List[str]:
+    urls: List[str] = []
+    base_no_page = re.sub(r"(\?|&)page=\d+", "", category_url_first_page)
+    page = 1
+    while page <= max_pages:
+        sep = "&" if "?" in base_no_page else "?"
+        url = f"{base_no_page}{sep}page={page}"
+        r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls)
+        soup = BeautifulSoup(r.text, "lxml")
+        anchors = soup.select('a[href*="/products/"]')
+        page_urls = []
+        for a in anchors:
+            href = a.get("href") or ""
+            if "/products/" in href:
+                if href.startswith("/"):
+                    href = BASE + href
+                if href.startswith(BASE) and href not in page_urls and href not in urls:
+                    page_urls.append(href)
+        if not page_urls:
+            break
+        urls.extend(page_urls)
+        page += 1
+        _throttle()
+    return urls
+
+# ---------------- Product page parser ----------------
+def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Optional[StoreItem]:
+    r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls)
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # Name / title
+    h1 = soup.find(["h1", "h2"], string=True)
+    name = h1.get_text(" ", strip=True) if h1 else url
+
+    # Price
+    price: Optional[float] = None
+    price_candidates = [
+        '.price__regular', '.price-item--regular', '.price', '.product__price',
+        '[data-product-price]', '.price__container', '.price__current'
+    ]
+    for sel in price_candidates:
+        el = soup.select_one(sel)
+        if el:
+            price = _clean_money(el.get_text(" ", strip=True))
+            if price is not None:
+                break
+    if price is None:
+        meta_price = soup.select_one('meta[itemprop="price"]')
+        if meta_price and meta_price.get("content"):
+            try:
+                price = float(meta_price["content"])
+            except Exception:
+                pass
+
+    # Page text
+    body_txt = soup.get_text(" ", strip=True)
+    body_up = body_txt.upper()
+
+    # PSA Cert
+    cert = None
+    m_cert = re.search(r'CERTIFICATION\s*#\s*(\d{6,9})', body_up)
+    if m_cert:
+        cert = m_cert.group(1)
+    else:
+        m_alt = re.search(r'PSA[^#]{0,30}#\s*(\d{6,9})', body_up)
+        if m_alt:
+            cert = m_alt.group(1)
+
+    # PSA Grade
+    grade_text = None
+    m_grade = re.search(r'GRADE\s*:\s*([A-Z\s\-]*\d{1,2})', body_up)
+    if m_grade:
+        grade_text = m_grade.group(1).title()
+    else:
+        m_g2 = re.search(r'PSA\s*(\d{1,2})', body_up)
+        if m_g2:
+            grade_text = f"PSA {m_g2.group(1)}"
+    grade_num = _grade_num_from_text(grade_text)
+
+    return StoreItem(
+        source="cardshq.com",
+        url=url,
+        card_name=name,
+        price=price,
+        psa_grade_text=grade_text,
+        psa_grade_num=grade_num,
+        psa_cert=cert
+    )
+
+# ---------------- PSA APR fetch ----------------
+def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Tuple[str, Optional[str]]:
+    # Try both PSA hosts to dodge CA chain weirdness in some environments
+    last_cert_url = None
+    for host in PSA_HOSTS:
+        cert_url = f"{host}/cert/{cert}/psa"
+        last_cert_url = cert_url
+        try:
+            r = _fetch(cert_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+        except requests.exceptions.SSLError:
+            # try next host
+            continue
+        soup = BeautifulSoup(r.text, "lxml")
+        apr_link = None
+        for a in soup.select("a"):
+            href = (a.get("href") or "").strip()
+            label = (a.get_text(strip=True) or "").lower()
+            if "auctionprices" in href.lower() or label == "sales history":
+                apr_link = href
+                break
+        if apr_link and apr_link.startswith("/"):
+            apr_link = f"{host}{apr_link}"
+        return cert_url, apr_link
+    # If we got here, both hosts failed to fetch (likely TLS)
+    return last_cert_url or f"{PSA_HOSTS[0]}/cert/{cert}/psa", None
+
+def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Optional[float]:
+    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+    text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
+    m = re.search(rf'PSA\s*{grade_num}\s*\$([0-9\.,]+)', text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
+
+def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> List[float]:
+    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+    text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
+    hits = re.findall(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', text)
+    out: List[float] = []
+    for h in hits[:take]:
+        try:
+            out.append(float(h.replace(",", "")))
+        except Exception:
+            continue
+    return out
+
+def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> PsaComp:
+    cert_url, apr_url = _psa_cert_and_apr_urls(cert, force_proxy=force_proxy, verify_tls=verify_tls)
+    most_recent_for_grade = None
+    median_recent_sales = None
+    last_n_prices: List[float] = []
+    if apr_url:
+        if grade_num is not None:
+            most_recent_for_grade = _psa_apr_most_recent_for_grade(apr_url, grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+            _throttle()
+        last_n_prices = _psa_apr_recent_prices(apr_url, take=25, force_proxy=force_proxy, verify_tls=verify_tls)
+        if last_n_prices:
+            sorted_vals = sorted(last_n_prices)
+            median_recent_sales = sorted_vals[len(sorted_vals)//2]
+    return PsaComp(
+        cert_url=cert_url,
+        apr_url=apr_url,
+        most_recent_for_grade=most_recent_for_grade,
+        median_recent_sales=median_recent_sales,
+        last_n_prices=last_n_prices
+    )
+
+# ---------------- Public orchestrators ----------------
+def scan_selected_categories(
+    categories: List[str],
+    limit_per_category: Optional[int] = None,
+    fee_rate: float = 0.13,
+    ship_out: float = 5.0,
+    *,
+    force_proxy: Optional[bool] = None,
+    verify_tls: bool = True
+) -> pd.DataFrame:
+    """
+    force_proxy:
+      - True  => always route requests via proxy
+      - False => always direct
+      - None  => auto (direct, SSLError -> proxy if configured)
+    verify_tls:
+      - True  => strict TLS verification using certifi (recommended)
+      - False => disable TLS verification (last resort)
+    """
+    selected: Dict[str, str] = {}
+    for label in categories:
+        if label in CARDSHQ_CATEGORY_URLS:
+            selected[label] = CARDSHQ_CATEGORY_URLS[label]
+
+    rows: List[Dict] = []
+    for label, first_page_url in selected.items():
+        product_urls = _discover_product_urls_for_category(first_page_url, max_pages=200, force_proxy=force_proxy, verify_tls=verify_tls)
+        found_items: List[StoreItem] = []
+        for pu in product_urls:
+            _throttle()
+            item = _scrape_cardshq_product(pu, force_proxy=force_proxy, verify_tls=verify_tls)
+            if not item:
+                continue
+            if item.psa_cert and item.psa_grade_num is not None:
+                found_items.append(item)
+                if limit_per_category and len(found_items) >= limit_per_category:
+                    break
+
+        for it in found_items:
+            _throttle()
+            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+            comp_value = comp.most_recent_for_grade or comp.median_recent_sales
+
+            expected_net = None
+            roi_pct = None
+            if comp_value is not None and it.price and it.price > 0:
+                expected_net = comp_value * (1 - fee_rate) - ship_out
+                roi_pct = (expected_net - it.price) / it.price * 100
+
+            rows.append({
+                "Category": label,
+                "Store": it.source,
+                "Card Name": it.card_name,
+                "Store Price": it.price,
+                "PSA Grade": it.psa_grade_text,
+                "PSA Cert": it.psa_cert,
+                "PSA Cert URL": comp.cert_url,
+                "PSA APR URL": comp.apr_url,
+                "APR Most Recent (Grade)": comp.most_recent_for_grade,
+                "APR Median Recent (All)": comp.median_recent_sales,
+                "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
+                "ROI % (est)": round(roi_pct, 2) if roi_pct is not None else None,
+                "Store URL": it.url
+            })
+
+    df = pd.DataFrame(rows)
+    if not df.empty and "ROI % (est)" in df.columns:
+        df = df.sort_values(by=["ROI % (est)"], ascending=False, na_position="last")
+    return df
+
+def test_psa_cert(cert: str, grade_num: Optional[int] = None, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Dict[str, Optional[float]]:
+    """
+    Quick connectivity + pricing test for a single PSA cert.
+    """
+    comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+    value = comp.most_recent_for_grade or comp.median_recent_sales
+    return {
+        "PSA Cert URL": comp.cert_url,
+        "PSA APR URL": comp.apr_url,
+        "APR Most Recent (Grade)": comp.most_recent_for_grade,
+        "APR Median Recent (All)": comp.median_recent_sales,
+        "Chosen Value": value
+    }
