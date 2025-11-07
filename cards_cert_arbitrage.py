@@ -3,7 +3,7 @@ import re
 import time
 import certifi
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Callable
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -102,6 +102,7 @@ def _fetch(
     allow_proxy_fallback: bool = True,
     force_proxy: Optional[bool] = None,
     verify_tls: bool = True,
+    logger: Optional[Callable[[str], None]] = None,
 ) -> requests.Response:
     """
     Robust fetch:
@@ -110,25 +111,34 @@ def _fetch(
       - force_proxy=None  -> try direct, on SSLError and if key exists -> proxy fallback
       - verify_tls=False  -> disable TLS verification (last resort; not recommended)
     """
+    mode = "auto"
+    if force_proxy is True: mode = "proxy"
+    if force_proxy is False: mode = "direct"
+    if logger: logger(f"GET {url}  | mode={mode}  tls_verify={'ON' if verify_tls else 'OFF'}")
+
     # Force proxy path
     if force_proxy is True:
         prox = _proxy_wrap(url)
         if not prox:
             raise RuntimeError("Proxy is forced but no SCRAPERAPI_KEY or ZENROWS_KEY configured.")
-        r = _get(prox, verify_tls=verify_tls)  # proxy still uses TLS outward
+        r = _get(prox, verify_tls=verify_tls)
+        if logger: logger(f" → via proxy {('scraperapi' if SCRAPERAPI_KEY else 'zenrows')}, status={r.status_code}")
         r.raise_for_status()
         return r
 
     # Direct path (with optional fallback)
     try:
         r = _get(url, verify_tls=verify_tls)
+        if logger: logger(f" → direct status={r.status_code}")
         r.raise_for_status()
         return r
-    except requests.exceptions.SSLError:
+    except requests.exceptions.SSLError as e:
+        if logger: logger(f" !! SSL error on direct: {e.__class__.__name__}")
         if allow_proxy_fallback and force_proxy is None:
             prox = _proxy_wrap(url)
             if prox:
                 rp = _get(prox, verify_tls=verify_tls)
+                if logger: logger(f" → retry via proxy {('scraperapi' if SCRAPERAPI_KEY else 'zenrows')}, status={rp.status_code}")
                 rp.raise_for_status()
                 return rp
         raise
@@ -171,14 +181,14 @@ def _grade_num_from_text(grade_text: Optional[str]) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 # ---------------- Category crawler ----------------
-def _discover_product_urls_for_category(category_url_first_page: str, max_pages: int = 200, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> List[str]:
+def _discover_product_urls_for_category(category_url_first_page: str, max_pages: int = 200, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> List[str]:
     urls: List[str] = []
     base_no_page = re.sub(r"(\?|&)page=\d+", "", category_url_first_page)
     page = 1
     while page <= max_pages:
         sep = "&" if "?" in base_no_page else "?"
         url = f"{base_no_page}{sep}page={page}"
-        r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls)
+        r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
         soup = BeautifulSoup(r.text, "lxml")
         anchors = soup.select('a[href*="/products/"]')
         page_urls = []
@@ -189,16 +199,18 @@ def _discover_product_urls_for_category(category_url_first_page: str, max_pages:
                     href = BASE + href
                 if href.startswith(BASE) and href not in page_urls and href not in urls:
                     page_urls.append(href)
+        if logger: logger(f"   page {page}: found {len(page_urls)} product links")
         if not page_urls:
             break
         urls.extend(page_urls)
         page += 1
         _throttle()
+    if logger: logger(f"[{category_url_first_page}] total discovered: {len(urls)}")
     return urls
 
 # ---------------- Product page parser ----------------
-def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Optional[StoreItem]:
-    r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls)
+def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Optional[StoreItem]:
+    r = _fetch(url, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     soup = BeautifulSoup(r.text, "lxml")
 
     # Name / title
@@ -250,6 +262,9 @@ def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, ver
             grade_text = f"PSA {m_g2.group(1)}"
     grade_num = _grade_num_from_text(grade_text)
 
+    if logger:
+        logger(f"   parsed product | cert={cert or '—'} grade={grade_text or '—'} price={price if price is not None else '—'}")
+
     return StoreItem(
         source="cardshq.com",
         url=url,
@@ -261,16 +276,16 @@ def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, ver
     )
 
 # ---------------- PSA APR fetch ----------------
-def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Tuple[str, Optional[str]]:
-    # Try both PSA hosts to dodge CA chain weirdness in some environments
+def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Tuple[str, Optional[str]]:
     last_cert_url = None
     for host in PSA_HOSTS:
         cert_url = f"{host}/cert/{cert}/psa"
         last_cert_url = cert_url
+        if logger: logger(f"   PSA cert try: {cert_url}")
         try:
-            r = _fetch(cert_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+            r = _fetch(cert_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
         except requests.exceptions.SSLError:
-            # try next host
+            if logger: logger("   PSA cert fetch SSL error; trying next host")
             continue
         soup = BeautifulSoup(r.text, "lxml")
         apr_link = None
@@ -282,23 +297,26 @@ def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, ver
                 break
         if apr_link and apr_link.startswith("/"):
             apr_link = f"{host}{apr_link}"
+        if logger: logger(f"   PSA APR link: {apr_link or '—'}")
         return cert_url, apr_link
-    # If we got here, both hosts failed to fetch (likely TLS)
     return last_cert_url or f"{PSA_HOSTS[0]}/cert/{cert}/psa", None
 
-def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Optional[float]:
-    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Optional[float]:
+    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
     m = re.search(rf'PSA\s*{grade_num}\s*\$([0-9\.,]+)', text)
     if not m:
+        if logger: logger("   PSA APR: no 'Most Recent' match for grade")
         return None
     try:
-        return float(m.group(1).replace(",", ""))
+        val = float(m.group(1).replace(",", ""))
+        if logger: logger(f"   PSA APR: Most Recent for PSA {grade_num} = ${val}")
+        return val
     except Exception:
         return None
 
-def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> List[float]:
-    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls)
+def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> List[float]:
+    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
     hits = re.findall(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', text)
     out: List[float] = []
@@ -307,21 +325,23 @@ def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optiona
             out.append(float(h.replace(",", "")))
         except Exception:
             continue
+    if logger: logger(f"   PSA APR: collected {len(out)} recent price tokens")
     return out
 
-def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> PsaComp:
-    cert_url, apr_url = _psa_cert_and_apr_urls(cert, force_proxy=force_proxy, verify_tls=verify_tls)
+def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> PsaComp:
+    cert_url, apr_url = _psa_cert_and_apr_urls(cert, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     most_recent_for_grade = None
     median_recent_sales = None
     last_n_prices: List[float] = []
     if apr_url:
         if grade_num is not None:
-            most_recent_for_grade = _psa_apr_most_recent_for_grade(apr_url, grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+            most_recent_for_grade = _psa_apr_most_recent_for_grade(apr_url, grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
             _throttle()
-        last_n_prices = _psa_apr_recent_prices(apr_url, take=25, force_proxy=force_proxy, verify_tls=verify_tls)
+        last_n_prices = _psa_apr_recent_prices(apr_url, take=25, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
         if last_n_prices:
             sorted_vals = sorted(last_n_prices)
             median_recent_sales = sorted_vals[len(sorted_vals)//2]
+            if logger: logger(f"   PSA APR: median recent (all rows) = ${median_recent_sales}")
     return PsaComp(
         cert_url=cert_url,
         apr_url=apr_url,
@@ -338,7 +358,8 @@ def scan_selected_categories(
     ship_out: float = 5.0,
     *,
     force_proxy: Optional[bool] = None,
-    verify_tls: bool = True
+    verify_tls: bool = True,
+    logger: Optional[Callable[[str], None]] = None
 ) -> pd.DataFrame:
     """
     force_proxy:
@@ -356,21 +377,28 @@ def scan_selected_categories(
 
     rows: List[Dict] = []
     for label, first_page_url in selected.items():
-        product_urls = _discover_product_urls_for_category(first_page_url, max_pages=200, force_proxy=force_proxy, verify_tls=verify_tls)
+        if logger: logger(f"[{label}] discovering products…")
+        product_urls = _discover_product_urls_for_category(first_page_url, max_pages=200, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+
         found_items: List[StoreItem] = []
-        for pu in product_urls:
+        for idx, pu in enumerate(product_urls, start=1):
             _throttle()
-            item = _scrape_cardshq_product(pu, force_proxy=force_proxy, verify_tls=verify_tls)
+            item = _scrape_cardshq_product(pu, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
             if not item:
                 continue
             if item.psa_cert and item.psa_grade_num is not None:
                 found_items.append(item)
                 if limit_per_category and len(found_items) >= limit_per_category:
+                    if logger: logger(f"  reached limit_per_category={limit_per_category}")
                     break
+            if idx % 25 == 0 and logger:
+                logger(f"  parsed {idx}/{len(product_urls)} product pages…")
+
+        if logger: logger(f"[{label}] PSA-cert listings: {len(found_items)} — fetching PSA APR…")
 
         for it in found_items:
             _throttle()
-            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
             comp_value = comp.most_recent_for_grade or comp.median_recent_sales
 
             expected_net = None
@@ -398,14 +426,24 @@ def scan_selected_categories(
     df = pd.DataFrame(rows)
     if not df.empty and "ROI % (est)" in df.columns:
         df = df.sort_values(by=["ROI % (est)"], ascending=False, na_position="last")
+    if logger: logger(f"[done] total rows={len(df)}")
     return df
 
-def test_psa_cert(cert: str, grade_num: Optional[int] = None, *, force_proxy: Optional[bool] = None, verify_tls: bool = True) -> Dict[str, Optional[float]]:
+def test_psa_cert(
+    cert: str,
+    grade_num: Optional[int] = None,
+    *,
+    force_proxy: Optional[bool] = None,
+    verify_tls: bool = True,
+    logger: Optional[Callable[[str], None]] = None
+) -> Dict[str, Optional[float]]:
     """
     Quick connectivity + pricing test for a single PSA cert.
     """
-    comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls)
+    if logger: logger(f"[test] PSA cert {cert}  grade={grade_num or '—'}")
+    comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     value = comp.most_recent_for_grade or comp.median_recent_sales
+    if logger: logger(f"[test] chosen value=${value if value is not None else '—'}")
     return {
         "PSA Cert URL": comp.cert_url,
         "PSA APR URL": comp.apr_url,
