@@ -8,7 +8,6 @@ from cards_cert_arbitrage import (
 st.set_page_config(page_title="PSA Cert Arbitrage Finder — CardsHQ", layout="wide")
 
 st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
-
 st.markdown(
     "Scans your chosen **CardsHQ** categories, opens each product, extracts "
     "**Card Name, Price, PSA Grade, PSA Cert**, then fetches PSA **Sales History** for that cert/grade "
@@ -17,13 +16,8 @@ st.markdown(
 
 with st.expander("Network settings", expanded=True):
     net_mode = st.radio(
-        "Network mode for all requests (CardsHQ + PSA):",
+        "Network mode (CardsHQ + PSA):",
         options=["Auto (default)", "Direct only", "Force proxy"],
-        help=(
-            "Auto: try direct HTTPS; on SSL error, retry via proxy if configured.\n"
-            "Direct only: never use proxy.\n"
-            "Force proxy: always proxy (requires SCRAPERAPI_KEY or ZENROWS_KEY in secrets)."
-        ),
         index=0,
         horizontal=True
     )
@@ -33,6 +27,12 @@ with st.expander("Network settings", expanded=True):
         force_proxy = False
     else:
         force_proxy = True
+
+    insecure_tls = st.checkbox(
+        "Unsafe: disable TLS verification for PSA & CardsHQ",
+        value=False,
+        help="Only use if you hit SSL certificate errors. Not recommended for long-term use."
+    )
 
 with st.expander("Scan settings", expanded=True):
     left, right = st.columns([2, 1])
@@ -60,14 +60,15 @@ run = st.button("Run category scan")
 st.caption("⚠️ Please respect each website’s Terms and robots.txt. For personal research.")
 
 @st.cache_data(show_spinner=False, ttl=60*20)
-def _run(categories, limit, fee_rate, ship_out, force_proxy):
+def _run(categories, limit, fee_rate, ship_out, force_proxy, insecure_tls):
     lim = None if limit == 0 else int(limit)
     return scan_selected_categories(
         categories=categories,
         limit_per_category=lim,
         fee_rate=float(fee_rate),
         ship_out=float(ship_out),
-        force_proxy=force_proxy
+        force_proxy=force_proxy,
+        verify_tls=not insecure_tls
     )
 
 if run:
@@ -76,7 +77,7 @@ if run:
     else:
         with st.spinner("Scanning categories and fetching PSA APR…"):
             try:
-                df = _run(chosen, limit, fee_rate, ship_out, force_proxy)
+                df = _run(chosen, limit, fee_rate, ship_out, force_proxy, insecure_tls)
             except Exception as e:
                 st.exception(e)
                 st.stop()
@@ -122,7 +123,12 @@ if submitted:
 
         with st.spinner("Fetching PSA Sales History…"):
             try:
-                data = test_psa_cert(cert.strip(), grade_num=grade_num, force_proxy=force_proxy)
+                data = test_psa_cert(
+                    cert.strip(),
+                    grade_num=grade_num,
+                    force_proxy=force_proxy,
+                    verify_tls=not insecure_tls
+                )
                 st.write(f"**Cert:** {cert}")
                 if data.get("PSA Cert URL"):
                     st.write(f"[PSA Cert Page]({data['PSA Cert URL']})")
@@ -134,21 +140,20 @@ if submitted:
                 c2.metric("Median Recent (all)", f"${data['APR Median Recent (All)']:,}" if data["APR Median Recent (All)"] else "—")
                 c3.metric("Chosen Value", f"${data['Chosen Value']:,}" if data["Chosen Value"] else "—")
 
-                if force_proxy is True:
-                    st.caption("Proxy mode: **Forced**")
-                elif force_proxy is False:
-                    st.caption("Proxy mode: **Direct only**")
-                else:
-                    st.caption("Proxy mode: **Auto** (direct, fallback to proxy on SSL error if configured)")
+                st.caption(
+                    f"Mode: **{'Force proxy' if force_proxy is True else 'Direct only' if force_proxy is False else 'Auto'}**, "
+                    f"TLS verify: **{'OFF (unsafe)' if insecure_tls else 'ON'}**"
+                )
             except Exception as e:
+                st.error("PSA request failed.")
                 st.exception(e)
 
 st.divider()
 st.markdown(
     """
-**Network modes**
-- **Auto (default)**: direct HTTPS first; on SSL error, retries via proxy if `SCRAPERAPI_KEY` or `ZENROWS_KEY` is set.
-- **Direct only**: never uses proxy (handy for local runs).
-- **Force proxy**: always uses proxy (requires a key in app secrets).
+**Tips if you still see SSL errors**
+- Try **Force proxy** mode and set a key in Streamlit Secrets (`SCRAPERAPI_KEY` or `ZENROWS_KEY`).
+- Toggle **Unsafe: disable TLS verification** (last resort; turn it off once you confirm connectivity).
+- Some hosted environments intermittently fail on `www.psacard.com` — this app auto-retries `psacard.com`.
 """
 )
