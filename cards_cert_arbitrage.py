@@ -12,7 +12,6 @@ from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 import pandas as pd
 
-
 PSA_HOSTS = {"www.psacard.com", "psacard.com"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -99,27 +98,32 @@ def _get(url: str, *, verify_tls: bool = True) -> requests.Response:
         verify=(certifi.where() if verify_tls else False),
     )
 
-def _fetch(
-    url: str,
-    *,
-    allow_proxy_fallback: bool = True,
-    force_proxy: Optional[bool] = None,
-    verify_tls: bool = True,
-    logger: Optional[Callable[[str], None]] = None,
-) -> requests.Response:
-    mode = "auto"
-    if force_proxy is True: mode = "proxy"
-    if force_proxy is False: mode = "direct"
-    if logger: logger(f"GET {url}  | mode={mode}  tls_verify={'ON' if verify_tls else 'OFF'}")
+def _fetch(url, method="GET", session=None, timeout=20, tls_verify=True, **kw):
+    s = session or requests.Session()
+    s.headers.setdefault("User-Agent", UA)
 
-    if force_proxy is True:
-        prox = _proxy_wrap(url)
-        if not prox:
-            raise RuntimeError("Proxy is forced but no SCRAPERAPI_KEY or ZENROWS_KEY configured.")
-        r = _get(prox, verify_tls=verify_tls)
-        if logger: logger(f" → via proxy {('scraperapi' if SCRAPERAPI_KEY else 'zenrows')}, status={r.status_code}")
+    # Robust retries for transient network/TLS hiccups
+    retries = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+
+    host = requests.utils.urlparse(url).hostname or ""
+    verify_param = tls_verify
+    if host in PSA_HOSTS:
+        # Prefer certifi bundle for PSA
+        verify_param = certifi.where() if tls_verify else False
+
+    try:
+        r = s.request(method, url, timeout=timeout, verify=verify_param, **kw)
         r.raise_for_status()
         return r
+    except requests.exceptions.SSLError as e:
+        # One PSA-only unsafe retry (no credentials involved)
+        if host in PSA_HOSTS and tls_verify:
+            r = s.request(method, url, timeout=timeout, verify=False, **kw)
+            r.raise_for_status()
+            return r
+        raise
+
 
     try:
         r = _get(url, verify_tls=verify_tls)
