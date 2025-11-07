@@ -1,29 +1,112 @@
+import os
 import re
 import time
+import certifi
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3 import Retry
+from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 import pandas as pd
 
 # ---------------- Config ----------------
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
 }
-THROTTLE = 1.25  # seconds between requests — be nice
+THROTTLE = 1.25  # seconds between requests — be polite
 BASE = "https://www.cardshq.com"
 
 # The only lists we scan (provided by user)
 CARDSHQ_CATEGORY_URLS = {
-    "Baseball":   f"{BASE}/collections/baseball-cards?page=1",
-    "Basketball (Graded)": f"{BASE}/collections/basketball-graded?page=1",
-    "Football":   f"{BASE}/collections/football-cards?page=1",
-    "Soccer":     f"{BASE}/collections/soccer-cards?page=1",
-    "Pokemon":    f"{BASE}/collections/pokemon-cards?page=1",
+    "Baseball":              f"{BASE}/collections/baseball-cards?page=1",
+    "Basketball (Graded)":   f"{BASE}/collections/basketball-graded?page=1",
+    "Football":              f"{BASE}/collections/football-cards?page=1",
+    "Soccer":                f"{BASE}/collections/soccer-cards?page=1",
+    "Pokemon":               f"{BASE}/collections/pokemon-cards?page=1",
 }
+
+# Optional proxy/fetcher fallback (set one of these in Streamlit Cloud Secrets)
+# SCRAPERAPI_KEY:   https://www.scraperapi.com/
+# ZENROWS_KEY:      https://www.zenrows.com/
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
+ZENROWS_KEY = os.environ.get("ZENROWS_KEY")
+
+# ---------------- Robust HTTPS session ----------------
+# Some origins are picky about ciphers/TLS; we provide a custom adapter + sane retries.
+CIPHERS = (
+    "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE+AES256:RSA+AESGCM:RSA+AES"
+)
+
+class TLS12HttpAdapter(HTTPAdapter):
+    """Force modern TLS + preferred ciphers to avoid handshake issues on some origins."""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = create_urllib3_context(ciphers=CIPHERS)
+        kwargs["ssl_context"] = ctx
+        kwargs["cert_reqs"] = "CERT_REQUIRED"
+        kwargs["ca_certs"] = certifi.where()
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        ctx = create_urllib3_context(ciphers=CIPHERS)
+        kwargs["ssl_context"] = ctx
+        kwargs["cert_reqs"] = "CERT_REQUIRED"
+        kwargs["ca_certs"] = certifi.where()
+        return super().proxy_manager_for(*args, **kwargs)
+
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "HEAD"])
+    )
+    adapter = TLS12HttpAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update(HEADERS)
+    return s
+
+SESSION = build_session()
+
+def _throttle():
+    time.sleep(THROTTLE)
+
+def _fetch(url: str, *, allow_proxy_fallback: bool = True) -> requests.Response:
+    """
+    Robust fetch:
+      1) Try direct HTTPS with hardened session
+      2) If SSLError/connection issues and proxy key exists, retry via proxy provider
+    """
+    try:
+        r = SESSION.get(url, timeout=30)
+        r.raise_for_status()
+        return r
+    except requests.exceptions.SSLError as e:
+        if allow_proxy_fallback and (SCRAPERAPI_KEY or ZENROWS_KEY):
+            # Proxy fallback
+            if SCRAPERAPI_KEY:
+                prox = f"https://api.scraperapi.com/?api_key={SCRAPERAPI_KEY}&url={requests.utils.quote(url, safe='')}"
+                rp = SESSION.get(prox, timeout=40)
+                rp.raise_for_status()
+                return rp
+            if ZENROWS_KEY:
+                prox = f"https://api.zenrows.com/v1/?apikey={ZENROWS_KEY}&url={requests.utils.quote(url, safe='')}"
+                rp = SESSION.get(prox, timeout=40)
+                rp.raise_for_status()
+                return rp
+        # If no proxy configured or still failing, bubble up
+        raise
+    except requests.RequestException:
+        # Let normal HTTP errors bubble; caller can handle if needed
+        raise
 
 # ---------------- Models ----------------
 @dataclass
@@ -45,9 +128,6 @@ class PsaComp:
     last_n_prices: List[float]
 
 # ---------------- Utils ----------------
-def _throttle():
-    time.sleep(THROTTLE)
-
 def _clean_money(txt: str) -> Optional[float]:
     if not txt:
         return None
@@ -67,23 +147,14 @@ def _grade_num_from_text(grade_text: Optional[str]) -> Optional[int]:
 
 # ---------------- Category crawler ----------------
 def _discover_product_urls_for_category(category_url_first_page: str, max_pages: int = 200) -> List[str]:
-    """
-    Crawl the given CardsHQ collection, paginating until no products are found.
-    Returns a list of product URLs (absolute).
-    """
     urls: List[str] = []
-    # Normalize to base path (replace ?page=1 with ?page=N as we increment)
     base_no_page = re.sub(r"(\?|&)page=\d+", "", category_url_first_page)
     page = 1
     while page <= max_pages:
-        # Keep original param order; append page as needed
         sep = "&" if "?" in base_no_page else "?"
         url = f"{base_no_page}{sep}page={page}"
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        if r.status_code != 200:
-            break
+        r = _fetch(url)
         soup = BeautifulSoup(r.text, "lxml")
-        # Product anchors containing /products/
         anchors = soup.select('a[href*="/products/"]')
         page_urls = []
         for a in anchors:
@@ -94,7 +165,6 @@ def _discover_product_urls_for_category(category_url_first_page: str, max_pages:
                 if href.startswith(BASE) and href not in page_urls and href not in urls:
                     page_urls.append(href)
         if not page_urls:
-            # No products => end
             break
         urls.extend(page_urls)
         page += 1
@@ -103,19 +173,14 @@ def _discover_product_urls_for_category(category_url_first_page: str, max_pages:
 
 # ---------------- Product page parser ----------------
 def _scrape_cardshq_product(url: str) -> Optional[StoreItem]:
-    """
-    Extract name, price, PSA grade (text + number), PSA cert from a CardsHQ product page.
-    """
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    if r.status_code != 200:
-        return None
+    r = _fetch(url)
     soup = BeautifulSoup(r.text, "lxml")
 
     # Name / title
     h1 = soup.find(["h1", "h2"], string=True)
     name = h1.get_text(" ", strip=True) if h1 else url
 
-    # Price: try common selectors then meta
+    # Price
     price: Optional[float] = None
     price_candidates = [
         '.price__regular', '.price-item--regular', '.price', '.product__price',
@@ -135,29 +200,26 @@ def _scrape_cardshq_product(url: str) -> Optional[StoreItem]:
             except Exception:
                 pass
 
-    # Whole page text (upper) for regex
+    # Page text
     body_txt = soup.get_text(" ", strip=True)
     body_up = body_txt.upper()
 
-    # PSA Cert: primary pattern "Certification #123456789"
+    # PSA Cert
     cert = None
     m_cert = re.search(r'CERTIFICATION\s*#\s*(\d{6,9})', body_up)
     if m_cert:
         cert = m_cert.group(1)
     else:
-        # Fallback like "... PSA ... #123456789"
         m_alt = re.search(r'PSA[^#]{0,30}#\s*(\d{6,9})', body_up)
         if m_alt:
             cert = m_alt.group(1)
 
     # PSA Grade
     grade_text = None
-    # Pattern like: "Grade: GEM MT 10" or "Grade: MINT 9"
     m_grade = re.search(r'GRADE\s*:\s*([A-Z\s\-]*\d{1,2})', body_up)
     if m_grade:
         grade_text = m_grade.group(1).title()
     else:
-        # Titles/descriptions often have "PSA 10" or "PSA 9"
         m_g2 = re.search(r'PSA\s*(\d{1,2})', body_up)
         if m_g2:
             grade_text = f"PSA {m_g2.group(1)}"
@@ -175,13 +237,8 @@ def _scrape_cardshq_product(url: str) -> Optional[StoreItem]:
 
 # ---------------- PSA APR fetch ----------------
 def _psa_cert_and_apr_urls(cert: str) -> Tuple[str, Optional[str]]:
-    """
-    Return (cert_url, apr_url) if found.
-    """
     cert_url = f"https://www.psacard.com/cert/{cert}/psa"
-    r = requests.get(cert_url, headers=HEADERS, timeout=30)
-    if r.status_code != 200:
-        return cert_url, None
+    r = _fetch(cert_url, allow_proxy_fallback=True)
     soup = BeautifulSoup(r.text, "lxml")
     apr_link = None
     for a in soup.select("a"):
@@ -195,12 +252,7 @@ def _psa_cert_and_apr_urls(cert: str) -> Tuple[str, Optional[str]]:
     return cert_url, apr_link
 
 def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int) -> Optional[float]:
-    """
-    Parse the APR page for the "PSA {grade} $X" 'Most Recent Price' value.
-    """
-    r = requests.get(apr_url, headers=HEADERS, timeout=30)
-    if r.status_code != 200:
-        return None
+    r = _fetch(apr_url, allow_proxy_fallback=True)
     text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
     m = re.search(rf'PSA\s*{grade_num}\s*\$([0-9\.,]+)', text)
     if not m:
@@ -211,110 +263,5 @@ def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int) -> Optional[flo
         return None
 
 def _psa_apr_recent_prices(apr_url: str, take: int = 25) -> List[float]:
-    """
-    Lightweight scan of the APR page to collect recent price numbers ($XX.XX).
-    """
-    r = requests.get(apr_url, headers=HEADERS, timeout=30)
-    if r.status_code != 200:
-        return []
-    text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
-    hits = re.findall(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', text)
-    out: List[float] = []
-    for h in hits[:take]:
-        try:
-            out.append(float(h.replace(",", "")))
-        except Exception:
-            continue
-    return out
-
-def _fetch_psa_comp(cert: str, grade_num: Optional[int]) -> PsaComp:
-    cert_url, apr_url = _psa_cert_and_apr_urls(cert)
-    most_recent_for_grade = None
-    median_recent_sales = None
-    last_n_prices: List[float] = []
-    if apr_url:
-        if grade_num is not None:
-            most_recent_for_grade = _psa_apr_most_recent_for_grade(apr_url, grade_num)
-            _throttle()
-        last_n_prices = _psa_apr_recent_prices(apr_url, take=25)
-        if last_n_prices:
-            sorted_vals = sorted(last_n_prices)
-            median_recent_sales = sorted_vals[len(sorted_vals)//2]
-    return PsaComp(
-        cert_url=cert_url,
-        apr_url=apr_url,
-        most_recent_for_grade=most_recent_for_grade,
-        median_recent_sales=median_recent_sales,
-        last_n_prices=last_n_prices
-    )
-
-# ---------------- Public orchestrator ----------------
-def scan_selected_categories(
-    categories: List[str],
-    limit_per_category: Optional[int] = None,
-    fee_rate: float = 0.13,
-    ship_out: float = 5.0
-) -> pd.DataFrame:
-    """
-    Crawl the selected CardsHQ categories, visit each product page, extract:
-     - store name, url, card name, store price, PSA grade, PSA cert
-     - PSA cert & APR URLs, Most Recent Price for the grade, and a median of recent prices
-     - compute a simple expected net and ROI% using fee_rate and ship_out
-
-    limit_per_category: if provided, stop after N PSA-cert listings per category (post-parse).
-    """
-    # Resolve which category URLs to use
-    selected: Dict[str, str] = {}
-    for label in categories:
-        if label in CARDSHQ_CATEGORY_URLS:
-            selected[label] = CARDSHQ_CATEGORY_URLS[label]
-
-    rows: List[Dict] = []
-    for label, first_page_url in selected.items():
-        # 1) Discover product URLs by paginating this category until exhaustion
-        product_urls = _discover_product_urls_for_category(first_page_url, max_pages=200)
-        # 2) Parse each product page for cert+grade
-        found_items: List[StoreItem] = []
-        for pu in product_urls:
-            _throttle()
-            item = _scrape_cardshq_product(pu)
-            if not item:
-                continue
-            # Only keep PSA-graded with a cert number
-            if item.psa_cert and item.psa_grade_num is not None:
-                found_items.append(item)
-                if limit_per_category and len(found_items) >= limit_per_category:
-                    break
-
-        # 3) For each valid item, fetch PSA APR and compute ROI
-        for it in found_items:
-            _throttle()
-            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num)
-            comp_value = comp.most_recent_for_grade or comp.median_recent_sales
-
-            expected_net = None
-            roi_pct = None
-            if comp_value is not None and it.price and it.price > 0:
-                expected_net = comp_value * (1 - fee_rate) - ship_out
-                roi_pct = (expected_net - it.price) / it.price * 100
-
-            rows.append({
-                "Category": label,
-                "Store": it.source,
-                "Card Name": it.card_name,
-                "Store Price": it.price,
-                "PSA Grade": it.psa_grade_text,
-                "PSA Cert": it.psa_cert,
-                "PSA Cert URL": comp.cert_url,
-                "PSA APR URL": comp.apr_url,
-                "APR Most Recent (Grade)": comp.most_recent_for_grade,
-                "APR Median Recent (All)": comp.median_recent_sales,
-                "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
-                "ROI % (est)": round(roi_pct, 2) if roi_pct is not None else None,
-                "Store URL": it.url
-            })
-
-    df = pd.DataFrame(rows)
-    if not df.empty and "ROI % (est)" in df.columns:
-        df = df.sort_values(by=["ROI % (est)"], ascending=False, na_position="last")
-    return df
+    r = _fetch(apr_url, allow_proxy_fallback=True)
+    text = BeautifulSoup(r.text, "l
