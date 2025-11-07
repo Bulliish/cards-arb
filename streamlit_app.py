@@ -1,14 +1,13 @@
-
 import os
 import streamlit as st
 import pandas as pd
 
 import cards_cert_arbitrage as arb
 
-st.set_page_config(page_title=\"Cards Cert Arbitrage\", layout=\"wide\")
+st.set_page_config(page_title="Cards Cert Arbitrage", layout="wide")
 
-st.title(\"Cards Cert Arbitrage — PSA Path A (TLS-hardened)\" )
-st.caption(\"Scans CardsHQ, extracts PSA certs, fetches PSA Estimate with PSA-scoped TLS fallback.\")
+st.title("Cards Cert Arbitrage — PSA Path A (TLS-hardened)")
+st.caption("Scans CardsHQ, extracts PSA certs, fetches PSA Estimate with PSA-scoped TLS fallback.")
 
 with st.sidebar:
     st.header(\"Settings\")
