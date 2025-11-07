@@ -12,6 +12,11 @@ from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 import pandas as pd
 
+
+PSA_HOSTS = {"www.psacard.com", "psacard.com"}
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
 # ---------------- Config ----------------
 HEADERS = {
     "User-Agent": (
