@@ -12,6 +12,9 @@ from urllib3.util.ssl_ import create_urllib3_context
 from bs4 import BeautifulSoup
 import pandas as pd
 
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+
 # ---------------- Config ----------------
 HEADERS = {
     "User-Agent": (
@@ -88,43 +91,44 @@ def _proxy_wrap(url: str) -> Optional[str]:
         return f"https://api.zenrows.com/v1/?apikey={ZENROWS_KEY}&url={quote(url, safe='')}"
     return None
 
-def _get(url: str, *, verify_tls: bool = True) -> requests.Response:
-    """Single GET with explicit CA bundle or disabled verification."""
-    return SESSION.get(
-        url,
-        timeout=30,
-        verify=(certifi.where() if verify_tls else False),
-    )
+def _get(url: str, *, verify_tls: bool) -> requests.Response:
+    """
+    Verified calls go through the shared SESSION (certifi, retries, adapters).
+    Insecure calls use a one-off raw requests.get with verify=False to avoid
+    the Session's SSL context (which has check_hostname=True).
+    """
+    if verify_tls:
+        return SESSION.get(url, timeout=30, verify=certifi.where())
+    else:
+        # one-off raw GET, no session adapters, no hostname check
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", InsecureRequestWarning)
+            return requests.get(url, timeout=30, verify=False, headers=HEADERS)
 
 def _fetch(
     url: str,
     *,
-    allow_proxy_fallback: bool = True,
-    force_proxy: Optional[bool] = None,
+    force_proxy: Optional[bool] = None,   # if you have this
     verify_tls: bool = True,
+    allow_psa_insecure_retry: bool = True,
     logger: Optional[Callable[[str], None]] = None,
 ) -> requests.Response:
-    """
-    Robust fetch:
-      - force_proxy=True  -> always use proxy (error if no key configured)
-      - force_proxy=False -> always direct (no proxy)
-      - force_proxy=None  -> try direct, on SSLError and if key exists -> proxy fallback
-      - verify_tls=False  -> disable TLS verification (last resort; not recommended)
-    """
-    mode = "auto"
-    if force_proxy is True: mode = "proxy"
-    if force_proxy is False: mode = "direct"
-    if logger: logger(f"GET {url}  | mode={mode}  tls_verify={'ON' if verify_tls else 'OFF'}")
-
-    # Force proxy path
-    if force_proxy is True:
-        prox = _proxy_wrap(url)
-        if not prox:
-            raise RuntimeError("Proxy is forced but no SCRAPERAPI_KEY or ZENROWS_KEY configured.")
-        r = _get(prox, verify_tls=verify_tls)
-        if logger: logger(f" → via proxy {('scraperapi' if SCRAPERAPI_KEY else 'zenrows')}, status={r.status_code}")
+    if logger:
+        logger(f"GET {url}  | mode={'auto' if force_proxy is None else 'proxy' if force_proxy else 'direct'}  tls_verify={'ON' if verify_tls else 'OFF'}")
+    try:
+        r = _get(url, verify_tls=verify_tls)
         r.raise_for_status()
         return r
+    except requests.exceptions.SSLError as e:
+        # PSA-only insecure retry
+        if allow_psa_insecure_retry and ("psacard.com" in url):
+            if logger: logger("  !! SSL error — PSA insecure retry (verify=OFF, raw requests.get)")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                r = requests.get(url, timeout=30, verify=False, headers=HEADERS)
+                r.raise_for_status()
+                return r
+        raise
 
     # Direct path (with optional fallback)
     try:
