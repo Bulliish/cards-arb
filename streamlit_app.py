@@ -1,3 +1,4 @@
+import time
 import streamlit as st
 from cards_cert_arbitrage import (
     scan_selected_categories,
@@ -7,6 +8,22 @@ from cards_cert_arbitrage import (
 
 st.set_page_config(page_title="PSA Cert Arbitrage Finder — CardsHQ", layout="wide")
 
+# --------- Simple in-app logger ----------
+if "log_lines" not in st.session_state:
+    st.session_state.log_lines = []
+
+def log(msg: str):
+    ts = time.strftime("%H:%M:%S")
+    st.session_state.log_lines.append(f"[{ts}] {msg}")
+
+def clear_log():
+    st.session_state.log_lines = []
+
+def render_log():
+    log_text = "\n".join(st.session_state.log_lines[-800:]) or "(log is empty)"
+    st.code(log_text, language="text")
+
+# -----------------------------------------
 st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
 st.markdown(
     "Scans your chosen **CardsHQ** categories, opens each product, extracts "
@@ -56,7 +73,11 @@ with st.expander("Scan settings", expanded=True):
             min_value=0.0, max_value=50.0, value=5.0, step=0.5
         )
 
-run = st.button("Run category scan")
+# --- Controls row: run + clear log
+c_run, c_clear = st.columns([1, 1])
+run = c_run.button("Run category scan")
+c_clear.button("🧹 Clear Log", on_click=clear_log)
+
 st.caption("⚠️ Please respect each website’s Terms and robots.txt. For personal research.")
 
 @st.cache_data(show_spinner=False, ttl=60*20)
@@ -68,20 +89,26 @@ def _run(categories, limit, fee_rate, ship_out, force_proxy, insecure_tls):
         fee_rate=float(fee_rate),
         ship_out=float(ship_out),
         force_proxy=force_proxy,
-        verify_tls=not insecure_tls
+        verify_tls=not insecure_tls,
+        logger=log
     )
 
 if run:
     if not chosen:
         st.warning("Pick at least one category to scan.")
     else:
+        clear_log()
+        log(f"START scan | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'}")
         with st.spinner("Scanning categories and fetching PSA APR…"):
             try:
                 df = _run(chosen, limit, fee_rate, ship_out, force_proxy, insecure_tls)
             except Exception as e:
+                log(f"ERROR: {e.__class__.__name__}: {e}")
                 st.exception(e)
                 st.stop()
+        log("Scan finished.")
 
+        st.subheader("Results")
         if df.empty:
             st.error("No PSA-cert listings found in the scanned categories.")
         else:
@@ -102,16 +129,23 @@ if run:
                 mime="text/csv"
             )
 
+# -------- Log Pane --------
+st.divider()
+st.subheader("📜 Log Pane")
+render_log()
+
+# -------- Quick PSA Cert Test --------
 st.divider()
 st.header("🔎 Quick PSA Cert Test")
 
 with st.form("psa_test_form", clear_on_submit=False):
-    colA, colB, colC = st.columns([2, 1, 1])
+    colA, colB = st.columns([2, 1])
     cert = colA.text_input("PSA Certification Number", placeholder="e.g., 92911899")
     grade_opt = colB.text_input("Grade (optional)", placeholder="e.g., 10")
     submitted = st.form_submit_button("Test cert")
 
 if submitted:
+    clear_log()
     if not cert or not cert.isdigit():
         st.warning("Enter a numeric PSA certification number.")
     else:
@@ -121,13 +155,15 @@ if submitted:
             st.warning("Grade must be a number (e.g., 9 or 10). Ignoring grade filter.")
             grade_num = None
 
+        log(f"TEST cert {cert} | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | grade={grade_num or '—'}")
         with st.spinner("Fetching PSA Sales History…"):
             try:
                 data = test_psa_cert(
                     cert.strip(),
                     grade_num=grade_num,
                     force_proxy=force_proxy,
-                    verify_tls=not insecure_tls
+                    verify_tls=not insecure_tls,
+                    logger=log
                 )
                 st.write(f"**Cert:** {cert}")
                 if data.get("PSA Cert URL"):
@@ -139,21 +175,9 @@ if submitted:
                 c1.metric("Most Recent (grade)", f"${data['APR Most Recent (Grade)']:,}" if data["APR Most Recent (Grade)"] else "—")
                 c2.metric("Median Recent (all)", f"${data['APR Median Recent (All)']:,}" if data["APR Median Recent (All)"] else "—")
                 c3.metric("Chosen Value", f"${data['Chosen Value']:,}" if data["Chosen Value"] else "—")
-
-                st.caption(
-                    f"Mode: **{'Force proxy' if force_proxy is True else 'Direct only' if force_proxy is False else 'Auto'}**, "
-                    f"TLS verify: **{'OFF (unsafe)' if insecure_tls else 'ON'}**"
-                )
             except Exception as e:
+                log(f"ERROR: {e.__class__.__name__}: {e}")
                 st.error("PSA request failed.")
                 st.exception(e)
 
-st.divider()
-st.markdown(
-    """
-**Tips if you still see SSL errors**
-- Try **Force proxy** mode and set a key in Streamlit Secrets (`SCRAPERAPI_KEY` or `ZENROWS_KEY`).
-- Toggle **Unsafe: disable TLS verification** (last resort; turn it off once you confirm connectivity).
-- Some hosted environments intermittently fail on `www.psacard.com` — this app auto-retries `psacard.com`.
-"""
-)
+st.caption("Tip: keep the Log Pane open during scans to see progress (pages, certs, PSA host, proxy, TLS).")
