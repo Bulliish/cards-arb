@@ -136,13 +136,19 @@ def _fetch(
         # PSA-only: one unsafe retry with verify=False (public HTML only)
         if host in PSA_HOSTNAMES and verify_tls:
             try:
-                r2 = SESSION.get(url, timeout=30, verify=False)
+                # IMPORTANT: use a fresh request that does NOT use the mounted TLS adapter
+                r2 = requests.get(
+                    url,
+                    timeout=30,
+                    verify=False,                 # allow an unsafe retry for public HTML
+                    headers=SESSION.headers       # keep same UA/headers
+                )
                 if logger: logger("    PSA-scoped unsafe retry " + ("succeeded" if r2.ok else "failed"))
                 r2.raise_for_status()
                 return r2
             except Exception as e2:
                 if logger: logger(f"    PSA-scoped unsafe retry error: {type(e2).__name__}")
-        # Optional proxy fallback
+        # Optional proxy fallback if available
         if allow_proxy_fallback and force_proxy is None:
             prox = _proxy_wrap(url)
             if prox:
@@ -151,6 +157,7 @@ def _fetch(
                 rp.raise_for_status()
                 return rp
         raise
+
 
 # ---------------- Models ----------------
 @dataclass
