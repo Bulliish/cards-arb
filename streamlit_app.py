@@ -27,8 +27,8 @@ def render_log():
 st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
 st.markdown(
     "Scans your chosen **CardsHQ** categories, opens each product, extracts "
-    "**Card Name, Price, PSA Grade, PSA Cert**, then fetches PSA **Sales History** for that cert/grade "
-    "and estimates ROI after fees & outbound shipping."
+    "**Card Name, Price, PSA Grade, PSA Cert**, then fetches PSA **Sales History** and the **PSA Estimate** "
+    "from the cert page, and estimates ROI after fees & outbound shipping."
 )
 
 with st.expander("Network settings", expanded=True):
@@ -99,7 +99,7 @@ if run:
     else:
         clear_log()
         log(f"START scan | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'}")
-        with st.spinner("Scanning categories and fetching PSA APR…"):
+        with st.spinner("Scanning categories, reading PSA Estimate, and fetching APR…"):
             try:
                 df = _run(chosen, limit, fee_rate, ship_out, force_proxy, insecure_tls)
             except Exception as e:
@@ -156,7 +156,7 @@ if submitted:
             grade_num = None
 
         log(f"TEST cert {cert} | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | grade={grade_num or '—'}")
-        with st.spinner("Fetching PSA Sales History…"):
+        with st.spinner("Fetching PSA Estimate & Sales History…"):
             try:
                 data = test_psa_cert(
                     cert.strip(),
@@ -171,13 +171,14 @@ if submitted:
                 if data.get("PSA APR URL"):
                     st.write(f"[PSA Sales History]({data['PSA APR URL']})")
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Most Recent (grade)", f"${data['APR Most Recent (Grade)']:,}" if data["APR Most Recent (Grade)"] else "—")
-                c2.metric("Median Recent (all)", f"${data['APR Median Recent (All)']:,}" if data["APR Median Recent (All)"] else "—")
-                c3.metric("Chosen Value", f"${data['Chosen Value']:,}" if data["Chosen Value"] else "—")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("PSA Estimate", f"${data['PSA Estimate (cert page)']:,}" if data["PSA Estimate (cert page)"] else "—")
+                c2.metric("Most Recent (grade)", f"${data['APR Most Recent (Grade)']:,}" if data["APR Most Recent (Grade)"] else "—")
+                c3.metric("Median Recent (all)", f"${data['APR Median Recent (All)']:,}" if data["APR Median Recent (All)"] else "—")
+                c4.metric("Chosen Value", f"${data['Chosen Value']:,}" if data["Chosen Value"] else "—")
             except Exception as e:
                 log(f"ERROR: {e.__class__.__name__}: {e}")
                 st.error("PSA request failed.")
                 st.exception(e)
 
-st.caption("Tip: keep the Log Pane open during scans to see progress (pages, certs, PSA host, proxy, TLS).")
+st.caption("Tip: keep the Log Pane open during scans to see progress (pages, certs, PSA host, proxy, TLS, and PSA Estimate extraction).")
