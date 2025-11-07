@@ -160,6 +160,7 @@ class PsaComp:
     apr_url: Optional[str]
     most_recent_for_grade: Optional[float]
     median_recent_sales: Optional[float]
+    psa_estimate: Optional[float]              # NEW: from cert page
     last_n_prices: List[float]
 
 # ---------------- Utils ----------------
@@ -217,11 +218,12 @@ def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, ver
     h1 = soup.find(["h1", "h2"], string=True)
     name = h1.get_text(" ", strip=True) if h1 else url
 
-    # Price
+    # Price: try multiple known patterns including the user's snippet
     price: Optional[float] = None
     price_candidates = [
         '.price__regular', '.price-item--regular', '.price', '.product__price',
-        '[data-product-price]', '.price__container', '.price__current'
+        '[data-product-price]', '.price__container', '.price__current',
+        'div.mr-auto.flex.w-auto.items-center.py-2.text-xl p',  # exact snippet path
     ]
     for sel in price_candidates:
         el = soup.select_one(sel)
@@ -230,12 +232,16 @@ def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, ver
             if price is not None:
                 break
     if price is None:
+        # Fallback: meta or whole-page scan (handles "$80.00 USD" etc.)
         meta_price = soup.select_one('meta[itemprop="price"]')
         if meta_price and meta_price.get("content"):
             try:
                 price = float(meta_price["content"])
             except Exception:
                 pass
+    if price is None:
+        # Ultimate fallback: search first "$..." token on page
+        price = _clean_money(soup.get_text(" ", strip=True))
 
     # Page text
     body_txt = soup.get_text(" ", strip=True)
@@ -275,8 +281,44 @@ def _scrape_cardshq_product(url: str, *, force_proxy: Optional[bool] = None, ver
         psa_cert=cert
     )
 
+# ---------------- PSA helpers ----------------
+def _extract_psa_estimate_from_cert_soup(soup: BeautifulSoup, logger: Optional[Callable[[str], None]] = None) -> Optional[float]:
+    """
+    Find the 'PSA Estimate' dollar value on the cert page.
+    Strategy:
+      1) Look for any element whose text contains 'PSA Estimate'
+      2) Search within its parent/container for the first $ amount
+      3) Fallback: regex 'PSA Estimate ... $123.45' in whole page text
+    """
+    # Direct label search
+    label_node = soup.find(string=re.compile(r'PSA\s*Estimate', re.I))
+    if label_node:
+        # search up to two ancestor levels for the amount
+        for ancestor in [label_node.parent, getattr(label_node, "parent", None) and label_node.parent.parent]:
+            if not ancestor:
+                continue
+            money = _clean_money(ancestor.get_text(" ", strip=True))
+            if money is not None:
+                if logger: logger(f"   PSA Estimate found in label container: ${money}")
+                return money
+
+    # Fallback regex across whole page
+    txt = soup.get_text(" ", strip=True)
+    m = re.search(r'PSA\s*Estimate[^$]{0,200}\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', txt, re.I | re.S)
+    if m:
+        try:
+            val = float(m.group(1).replace(",", ""))
+            if logger: logger(f"   PSA Estimate (fallback regex): ${val}")
+            return val
+        except Exception:
+            return None
+    return None
+
 # ---------------- PSA APR fetch ----------------
-def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Tuple[str, Optional[str]]:
+def _psa_cert_info(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Tuple[str, Optional[str], Optional[float]]:
+    """
+    Returns (cert_url, apr_url, psa_estimate)
+    """
     last_cert_url = None
     for host in PSA_HOSTS:
         cert_url = f"{host}/cert/{cert}/psa"
@@ -288,6 +330,11 @@ def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, ver
             if logger: logger("   PSA cert fetch SSL error; trying next host")
             continue
         soup = BeautifulSoup(r.text, "lxml")
+
+        # NEW: grab PSA Estimate before we leave the page
+        psa_estimate = _extract_psa_estimate_from_cert_soup(soup, logger=logger)
+
+        # Find Sales History link
         apr_link = None
         for a in soup.select("a"):
             href = (a.get("href") or "").strip()
@@ -297,9 +344,10 @@ def _psa_cert_and_apr_urls(cert: str, *, force_proxy: Optional[bool] = None, ver
                 break
         if apr_link and apr_link.startswith("/"):
             apr_link = f"{host}{apr_link}"
-        if logger: logger(f"   PSA APR link: {apr_link or '—'}")
-        return cert_url, apr_link
-    return last_cert_url or f"{PSA_HOSTS[0]}/cert/{cert}/psa", None
+        if logger: logger(f"   PSA APR link: {apr_link or '—'}; PSA Estimate: {psa_estimate if psa_estimate is not None else '—'}")
+        return cert_url, apr_link, psa_estimate
+    # If all hosts failed:
+    return last_cert_url or f"{PSA_HOSTS[0]}/cert/{cert}/psa", None, None
 
 def _psa_apr_most_recent_for_grade(apr_url: str, grade_num: int, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Optional[float]:
     r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
@@ -329,7 +377,7 @@ def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optiona
     return out
 
 def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> PsaComp:
-    cert_url, apr_url = _psa_cert_and_apr_urls(cert, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+    cert_url, apr_url, psa_estimate = _psa_cert_info(cert, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
     most_recent_for_grade = None
     median_recent_sales = None
     last_n_prices: List[float] = []
@@ -347,6 +395,7 @@ def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optiona
         apr_url=apr_url,
         most_recent_for_grade=most_recent_for_grade,
         median_recent_sales=median_recent_sales,
+        psa_estimate=psa_estimate,
         last_n_prices=last_n_prices
     )
 
@@ -394,12 +443,18 @@ def scan_selected_categories(
             if idx % 25 == 0 and logger:
                 logger(f"  parsed {idx}/{len(product_urls)} product pages…")
 
-        if logger: logger(f"[{label}] PSA-cert listings: {len(found_items)} — fetching PSA APR…")
+        if logger: logger(f"[{label}] PSA-cert listings: {len(found_items)} — fetching PSA comps…")
 
         for it in found_items:
             _throttle()
             comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
-            comp_value = comp.most_recent_for_grade or comp.median_recent_sales
+
+            # Choose best comp value in priority order
+            comp_value = None
+            for v in (comp.most_recent_for_grade, comp.psa_estimate, comp.median_recent_sales):
+                if v is not None:
+                    comp_value = v
+                    break
 
             expected_net = None
             roi_pct = None
@@ -416,6 +471,7 @@ def scan_selected_categories(
                 "PSA Cert": it.psa_cert,
                 "PSA Cert URL": comp.cert_url,
                 "PSA APR URL": comp.apr_url,
+                "PSA Estimate (cert page)": comp.psa_estimate,     # NEW
                 "APR Most Recent (Grade)": comp.most_recent_for_grade,
                 "APR Median Recent (All)": comp.median_recent_sales,
                 "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
@@ -442,11 +498,17 @@ def test_psa_cert(
     """
     if logger: logger(f"[test] PSA cert {cert}  grade={grade_num or '—'}")
     comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
-    value = comp.most_recent_for_grade or comp.median_recent_sales
+    # Choose best value with new PSA Estimate in the mix
+    value = None
+    for v in (comp.most_recent_for_grade, comp.psa_estimate, comp.median_recent_sales):
+        if v is not None:
+            value = v
+            break
     if logger: logger(f"[test] chosen value=${value if value is not None else '—'}")
     return {
         "PSA Cert URL": comp.cert_url,
         "PSA APR URL": comp.apr_url,
+        "PSA Estimate (cert page)": comp.psa_estimate,
         "APR Most Recent (Grade)": comp.most_recent_for_grade,
         "APR Median Recent (All)": comp.median_recent_sales,
         "Chosen Value": value
