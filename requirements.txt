@@ -4,3 +4,5 @@ lxml
 pandas
 python-dateutil
 streamlit
+certifi
+urllib3
