@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 from urllib3.util.ssl_ import create_urllib3_context
+from urllib.parse import urlparse, quote
 from bs4 import BeautifulSoup
 import pandas as pd
 
@@ -38,6 +39,8 @@ ZENROWS_KEY   = os.environ.get("ZENROWS_KEY")
 
 # PSA hosts to try
 PSA_HOSTS = ["https://www.psacard.com", "https://psacard.com"]
+# Hostname set for quick checks in _fetch
+PSA_HOSTNAMES = {"www.psacard.com", "psacard.com"}
 
 # ---------------- Robust HTTPS session ----------------
 CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE+AES256:RSA+AESGCM:RSA+AES"
@@ -80,10 +83,8 @@ def _throttle():
 
 def _proxy_wrap(url: str) -> Optional[str]:
     if SCRAPERAPI_KEY:
-        from requests.utils import quote
         return f"https://api.scraperapi.com/?api_key={SCRAPERAPI_KEY}&url={quote(url, safe='')}"
     if ZENROWS_KEY:
-        from requests.utils import quote
         return f"https://api.zenrows.com/v1/?apikey={ZENROWS_KEY}&url={quote(url, safe='')}"
     return None
 
@@ -102,11 +103,18 @@ def _fetch(
     verify_tls: bool = True,
     logger: Optional[Callable[[str], None]] = None,
 ) -> requests.Response:
+    """
+    Direct-first fetch using certifi CA; on SSLError:
+      - If host is PSA, do a single unsafe retry (verify=False) for public HTML.
+      - Then (optionally) fall back to proxy if keys are configured.
+    This preserves your original interface & logging.
+    """
     mode = "auto"
     if force_proxy is True: mode = "proxy"
     if force_proxy is False: mode = "direct"
     if logger: logger(f"GET {url}  | mode={mode}  tls_verify={'ON' if verify_tls else 'OFF'}")
 
+    # Forced proxy path unchanged
     if force_proxy is True:
         prox = _proxy_wrap(url)
         if not prox:
@@ -116,6 +124,8 @@ def _fetch(
         r.raise_for_status()
         return r
 
+    # Direct-first path
+    host = (urlparse(url).hostname or "").lower()
     try:
         r = _get(url, verify_tls=verify_tls)
         if logger: logger(f" → direct status={r.status_code}")
@@ -123,6 +133,16 @@ def _fetch(
         return r
     except requests.exceptions.SSLError as e:
         if logger: logger(f" !! SSL error on direct: {e.__class__.__name__}")
+        # PSA-only: one unsafe retry with verify=False (public HTML only)
+        if host in PSA_HOSTNAMES and verify_tls:
+            try:
+                r2 = SESSION.get(url, timeout=30, verify=False)
+                if logger: logger("    PSA-scoped unsafe retry " + ("succeeded" if r2.ok else "failed"))
+                r2.raise_for_status()
+                return r2
+            except Exception as e2:
+                if logger: logger(f"    PSA-scoped unsafe retry error: {type(e2).__name__}")
+        # Optional proxy fallback
         if allow_proxy_fallback and force_proxy is None:
             prox = _proxy_wrap(url)
             if prox:
