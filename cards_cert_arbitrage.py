@@ -45,6 +45,14 @@ PSA_HOSTNAMES = {"www.psacard.com", "psacard.com"}
 # ---------------- Robust HTTPS session ----------------
 CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE+AES256:RSA+AESGCM:RSA+AES"
 
+def _mirror_url(url: str) -> str:
+    # Use r.jina.ai to fetch a read-only HTML rendering (no JS/cookies)
+    # Must pass an http:// URL path to r.jina.ai
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    # r.jina.ai wants scheme-less http target
+    return f"https://r.jina.ai/http://{p.hostname}{p.path}"
+
 class TLS12HttpAdapter(HTTPAdapter):
     """Force modern TLS + preferred ciphers to avoid handshake issues on some origins."""
     def init_poolmanager(self, *args, **kwargs):
@@ -136,18 +144,38 @@ def _fetch(
         # PSA-only: one unsafe retry with verify=False (public HTML only)
         if host in PSA_HOSTNAMES and verify_tls:
             try:
-                # IMPORTANT: use a fresh request that does NOT use the mounted TLS adapter
+                # Use a fresh one-off request that bypasses the mounted adapter
                 r2 = requests.get(
                     url,
                     timeout=30,
-                    verify=False,                 # allow an unsafe retry for public HTML
-                    headers=SESSION.headers       # keep same UA/headers
+                    verify=False,                  # allow an unsafe retry for public HTML
+                    headers=SESSION.headers
                 )
-                if logger: logger("    PSA-scoped unsafe retry " + ("succeeded" if r2.ok else "failed"))
-                r2.raise_for_status()
-                return r2
+                if r2.ok:
+                    if logger: logger("    PSA-scoped unsafe retry succeeded")
+                    r2.raise_for_status()
+                    return r2
+                else:
+                    if logger: logger("    PSA-scoped unsafe retry failed")
+                    # Try mirror fallback on non-200 (e.g., 403)
+                    murl = _mirror_url(url)
+                    if logger: logger(f"    Mirror try: {murl}")
+                    rm = requests.get(murl, timeout=30, headers=SESSION.headers)
+                    if logger: logger(f"    Mirror status={rm.status_code}")
+                    rm.raise_for_status()
+                    return rm
             except Exception as e2:
                 if logger: logger(f"    PSA-scoped unsafe retry error: {type(e2).__name__}")
+                # Try mirror as last resort
+                try:
+                    murl = _mirror_url(url)
+                    if logger: logger(f"    Mirror try: {murl}")
+                    rm = requests.get(murl, timeout=30, headers=SESSION.headers)
+                    if logger: logger(f"    Mirror status={rm.status_code}")
+                    rm.raise_for_status()
+                    return rm
+                except Exception as e3:
+                    if logger: logger(f"    Mirror error: {type(e3).__name__}")
         # Optional proxy fallback if available
         if allow_proxy_fallback and force_proxy is None:
             prox = _proxy_wrap(url)
@@ -157,6 +185,7 @@ def _fetch(
                 rp.raise_for_status()
                 return rp
         raise
+
 
 
 # ---------------- Models ----------------
@@ -432,8 +461,17 @@ def _parse_most_recent_by_grade_from_apr_soup(soup: BeautifulSoup, grade_num: in
     return None
 
 def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> List[float]:
-    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
-    text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
+    try:
+        r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+        html = r.text
+    except Exception as e:
+        if logger: logger(f"   APR fetch error {type(e).__name__}; trying mirror")
+        rm = requests.get(_mirror_url(apr_url), timeout=30, headers=SESSION.headers)
+        if logger: logger(f"   APR mirror status={rm.status_code}")
+        rm.raise_for_status()
+        html = rm.text
+
+    text = BeautifulSoup(html, "lxml").get_text(" ", strip=True)
     hits = re.findall(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', text)
     out: List[float] = []
     for h in hits[:take]:
