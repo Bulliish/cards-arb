@@ -1,18 +1,22 @@
+import os
 import streamlit as st
 from cards_cert_arbitrage import scan_selected_categories, CARDSHQ_CATEGORY_URLS
 
-st.set_page_config(page_title="PSA Cert Arbitrage Finder", layout="wide")
+st.set_page_config(page_title="PSA Cert Arbitrage Finder — CardsHQ", layout="wide")
 
 st.title("🧾 PSA Cert Arbitrage Finder — CardsHQ Categories")
+
 st.markdown(
-    "Scans the **exact categories** you provided on CardsHQ, opens each product page, "
-    "extracts **Card Name, Price, PSA Grade, PSA Cert**, looks up the **PSA Sales History** "
-    "price for that grade, and estimates ROI."
+    "This scans your chosen **CardsHQ** categories, opens each product, extracts "
+    "**Card Name, Price, PSA Grade, PSA Cert**, then fetches PSA **Sales History** for that cert/grade "
+    "and estimates ROI after fees & outbound shipping."
 )
 
 st.info(
-    "Heads up: Scraping is throttled to be polite (default ~1.25s/request). "
-    "Large scans can take a bit depending on inventory size."
+    "If you see SSL/handshake errors to PSA on Streamlit Cloud, set a proxy in **Secrets**:\n\n"
+    "- `SCRAPERAPI_KEY: your_key_here`  (ScraperAPI)\n"
+    "- or `ZENROWS_KEY: your_key_here` (ZenRows)\n\n"
+    "The app will automatically retry PSA requests through the proxy when needed."
 )
 
 with st.expander("Settings", expanded=True):
@@ -29,16 +33,16 @@ with st.expander("Settings", expanded=True):
         )
     with right:
         fee_rate = st.number_input(
-            "Selling fee rate (eBay/marketplace) — e.g. 0.13 = 13%",
+            "Selling fee rate (e.g., eBay 13% = 0.13)",
             min_value=0.0, max_value=0.30, value=0.13, step=0.01, format="%.2f"
         )
         ship_out = st.number_input(
-            "Your outbound shipping/fulfillment cost ($)",
+            "Outbound shipping/fulfillment cost ($)",
             min_value=0.0, max_value=50.0, value=5.0, step=0.5
         )
 
 run = st.button("Run scan")
-st.caption("⚠️ Please respect each website’s Terms and robots.txt. This tool is for your personal research.")
+st.caption("⚠️ Respect each website’s Terms and robots.txt. This is for personal research.")
 
 @st.cache_data(show_spinner=False, ttl=60*20)
 def _run(categories, limit, fee_rate, ship_out):
@@ -55,12 +59,15 @@ if run:
         st.warning("Pick at least one category to scan.")
     else:
         with st.spinner("Scanning categories and fetching PSA APR…"):
-            df = _run(chosen, limit, fee_rate, ship_out)
+            try:
+                df = _run(chosen, limit, fee_rate, ship_out)
+            except Exception as e:
+                st.exception(e)
+                st.stop()
 
         if df.empty:
             st.error("No PSA-cert listings found in the scanned categories.")
         else:
-            # KPIs
             total_rows = int(df.shape[0])
             pos_count = int(df["ROI % (est)"].fillna(-999).gt(0).sum())
             c1, c2, c3 = st.columns(3)
@@ -68,14 +75,8 @@ if run:
             c2.metric("Positive ROI (est)", f"{pos_count:,}")
             c3.metric("Categories scanned", f"{len(chosen)}")
 
-            # Display table
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # Download
             csv = df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "Download CSV",
@@ -87,17 +88,9 @@ if run:
 st.divider()
 st.markdown(
     """
-**Included categories (fixed):**
-- Baseball — `/collections/baseball-cards`  
-- Basketball (Graded) — `/collections/basketball-graded`  
-- Football — `/collections/football-cards`  
-- Soccer — `/collections/soccer-cards`  
-- Pokemon — `/collections/pokemon-cards`  
-
-**Notes**
-- We paginate each category until no more product links are present.
-- Product pages are parsed for **Certification #** and **Grade** (pattern matches handle common variations).
-- PSA **Most Recent Price** for the scraped grade is used when available; otherwise we show a median of recent sale prices captured from the page.
-- ROI = `(APR * (1 - fee_rate) - ship_out - ask) / ask`.
+**How proxy fallback works**
+- The app first tries **direct HTTPS** with a hardened TLS adapter and retries.
+- If it hits an **SSLError** to PSA and you’ve set `SCRAPERAPI_KEY` or `ZENROWS_KEY` in Streamlit **Secrets**, it automatically retries through that provider.
+- No proxy keys? It will stay on direct mode and surface the SSL error (good for debugging).
 """
 )
