@@ -536,6 +536,7 @@ def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optiona
     )
 
 # ---------------- Public orchestrators ----------------
+
 def scan_selected_categories(
     categories: List[str],
     limit_per_category: Optional[int] = None,
@@ -554,27 +555,82 @@ def scan_selected_categories(
 
     rows: List[Dict] = []
     for label, first_page_url in selected.items():
-        if logger: logger(f"[{label}] discovering products…")
-        product_urls = _discover_product_urls_for_category(first_page_url, max_pages=200, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+        if logger:
+            logger(f"[{label}] discovering products…")
+        product_urls = _discover_product_urls_for_category(
+            first_page_url,
+            max_pages=200,
+            force_proxy=force_proxy,
+            verify_tls=verify_tls,
+            logger=logger,
+        )
 
         found_items: List[StoreItem] = []
+        total_products = 0
+
         for idx, pu in enumerate(product_urls, start=1):
             _throttle()
-            item = _scrape_cardshq_product(pu, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+            item = _scrape_cardshq_product(
+                pu,
+                force_proxy=force_proxy,
+                verify_tls=verify_tls,
+                logger=logger,
+            )
             if not item:
                 continue
-            if item.psa_cert and item.psa_grade_num is not None:
+            total_products += 1
+
+            # Treat anything clearly PSA-graded as a candidate
+            text_blob = f"{item.card_name} {item.psa_grade_text or ''}".upper()
+            is_psa_like = (
+                (item.psa_cert is not None)
+                or (item.psa_grade_num is not None)
+                or (" PSA " in f" {text_blob} ")
+            )
+            if is_psa_like:
                 found_items.append(item)
                 if limit_per_category and len(found_items) >= limit_per_category:
-                    if logger: logger(f"  reached limit_per_category={limit_per_category}")
+                    if logger:
+                        logger(f"  reached limit_per_category={limit_per_category}")
                     break
+
             if idx % 25 == 0 and logger:
                 logger(f"  parsed {idx}/{len(product_urls)} product pages…")
 
-        if logger: logger(f"[{label}] PSA-cert listings: {len(found_items)} — fetching PSA comps…")
+        if logger:
+            logger(
+                f"[{label}] total products parsed: {total_products}, PSA-like listings: {len(found_items)} — fetching PSA comps…"
+            )
 
         for it in found_items:
             _throttle()
+
+            # If there is no PSA cert, we can't hit PSA APIs; still record the store-side info.
+            if not it.psa_cert:
+                if logger:
+                    logger(
+                        f"   listing appears PSA-graded but has no cert number on page; keeping Store row only: {it.url}"
+                    )
+                rows.append(
+                    {
+                        "Category": label,
+                        "Store": it.source,
+                        "Card Name": it.card_name,
+                        "Store Price": it.price,
+                        "PSA Grade": it.psa_grade_text,
+                        "PSA Cert": None,
+                        "PSA Cert URL": None,
+                        "PSA APR URL": None,
+                        "PSA Estimate (cert page)": None,
+                        "APR Most Recent (Grade)": None,
+                        "APR Median Recent (All)": None,
+                        "Expected Net (est)": None,
+                        "ROI % (est)": None,
+                        "Store URL": it.url,
+                    }
+                )
+                continue
+
             try:
                 comp = _fetch_psa_comp(
                     it.psa_cert,
@@ -587,19 +643,29 @@ def scan_selected_categories(
             except requests.exceptions.HTTPError as e:
                 if logger:
                     status = getattr(getattr(e, "response", None), "status_code", "unknown")
-                    logger(f"   PSA HTTP error for cert {it.psa_cert or 'unknown'} (status={status}): {e}. Skipping this card.")
-                continue
+                    logger(
+                        f"   PSA HTTP error for cert {it.psa_cert or 'unknown'} (status={status}): {e}. Skipping PSA data for this card."
+                    )
+                comp = None
 
-            # Choose best comp value in priority order
             comp_value = None
-            for v in (
-                comp.most_recent_for_grade,
-                comp.psa_estimate,
-                comp.median_recent_sales,
-            ):
-                if v is not None:
-                    comp_value = v
-                    break
+            psa_cert_url = None
+            psa_apr_url = None
+            psa_estimate = None
+            apr_most_recent = None
+            apr_median_all = None
+
+            if comp is not None:
+                psa_cert_url = comp.cert_url
+                psa_apr_url = comp.apr_url
+                psa_estimate = comp.psa_estimate
+                apr_most_recent = comp.most_recent_for_grade
+                apr_median_all = comp.median_recent_sales
+
+                for v in (apr_most_recent, psa_estimate, apr_median_all):
+                    if v is not None:
+                        comp_value = v
+                        break
 
             expected_net = None
             roi_pct = None
@@ -615,22 +681,23 @@ def scan_selected_categories(
                     "Store Price": it.price,
                     "PSA Grade": it.psa_grade_text,
                     "PSA Cert": it.psa_cert,
-                    "PSA Cert URL": comp.cert_url,
-                    "PSA APR URL": comp.apr_url,
-                    "PSA Estimate (cert page)": comp.psa_estimate,
-                    "APR Most Recent (Grade)": comp.most_recent_for_grade,
-                    "APR Median Recent (All)": comp.median_recent_sales,
+                    "PSA Cert URL": psa_cert_url,
+                    "PSA APR URL": psa_apr_url,
+                    "PSA Estimate (cert page)": psa_estimate,
+                    "APR Most Recent (Grade)": apr_most_recent,
+                    "APR Median Recent (All)": apr_median_all,
                     "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
                     "ROI % (est)": round(roi_pct, 2) if roi_pct is not None else None,
                     "Store URL": it.url,
-                })
+                }
+            )
 
     df = pd.DataFrame(rows)
     if not df.empty and "ROI % (est)" in df.columns:
         df = df.sort_values(by=["ROI % (est)"], ascending=False, na_position="last")
-    if logger: logger(f"[done] total rows={len(df)}")
+    if logger:
+        logger(f"[done] total rows={len(df)}")
     return df
-
 def test_psa_cert(
     cert: str,
     grade_num: Optional[int] = None,
