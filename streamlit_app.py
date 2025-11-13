@@ -1,3 +1,4 @@
+
 import os
 import sys
 import time
@@ -110,6 +111,13 @@ with st.expander("Network settings", expanded=True):
         help="Only use if you hit SSL certificate errors. Not recommended for long-term use."
     )
 
+with st.expander("PSA parsing options", expanded=True):
+    use_playwright_apr = st.toggle(
+        "Use Playwright fallback for 'Auction Prices by Grade'",
+        value=True,
+        help="If the APR table doesn't parse via requests/BeautifulSoup, try a headless Chromium fetch to extract the table."
+    )
+
 with st.expander("Scan settings", expanded=True):
     left, right = st.columns([2, 1])
     with left:
@@ -140,7 +148,7 @@ c_clear.button("🧹 Clear Log", on_click=clear_log)
 st.caption("⚠️ Please respect each website’s Terms and robots.txt. For personal research.")
 
 @st.cache_data(show_spinner=False, ttl=60*20)
-def _run(categories, limit, fee_rate, ship_out, force_proxy, insecure_tls):
+def _run(categories, limit, fee_rate, ship_out, force_proxy, insecure_tls, use_playwright_apr):
     lim = None if limit == 0 else int(limit)
     return scan_selected_categories(
         categories=categories,
@@ -149,6 +157,7 @@ def _run(categories, limit, fee_rate, ship_out, force_proxy, insecure_tls):
         ship_out=float(ship_out),
         force_proxy=force_proxy,
         verify_tls=not insecure_tls,
+        use_playwright_apr=use_playwright_apr,
         logger=log
     )
 
@@ -157,10 +166,10 @@ if run:
         st.warning("Pick at least one category to scan.")
     else:
         clear_log()
-        log(f"START scan | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | parser={os.environ.get('BS_PARSER','lxml')}")
+        log(f"START scan | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | playwright={'ON' if use_playwright_apr else 'OFF'}")
         with st.spinner("Scanning categories, reading PSA Estimate, and fetching APR…"):
             try:
-                df = _run(chosen, limit, fee_rate, ship_out, force_proxy, insecure_tls)
+                df = _run(chosen, limit, fee_rate, ship_out, force_proxy, insecure_tls, use_playwright_apr)
             except Exception as e:
                 log(f"ERROR: {e.__class__.__name__}: {e}")
                 if show_stack:
@@ -217,7 +226,7 @@ if submitted:
             st.warning("Grade must be a number (e.g., 9 or 10). Ignoring grade filter.")
             grade_num = None
 
-        log(f"TEST cert {cert} | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | grade={grade_num or '—'} | parser={os.environ.get('BS_PARSER','lxml')}")
+        log(f"TEST cert {cert} | mode={'Auto' if force_proxy is None else 'Direct' if force_proxy is False else 'Proxy'} | TLS={'ON' if not insecure_tls else 'OFF'} | grade={grade_num or '—'} | playwright={'ON' if use_playwright_apr else 'OFF'}")
         with st.spinner("Fetching PSA Estimate & Sales History…"):
             try:
                 data = test_psa_cert(
@@ -225,6 +234,7 @@ if submitted:
                     grade_num=grade_num,
                     force_proxy=force_proxy,
                     verify_tls=not insecure_tls,
+                    use_playwright_apr=use_playwright_apr,
                     logger=log
                 )
                 st.write(f"**Cert:** {cert}")
