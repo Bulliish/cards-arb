@@ -1,3 +1,4 @@
+
 import os
 import re
 import time
@@ -9,9 +10,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import Retry
 from urllib3.util.ssl_ import create_urllib3_context
-from urllib.parse import urlparse, quote
 from bs4 import BeautifulSoup
 import pandas as pd
+
+# ---- Optional Playwright (APR table fallback) ----
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+    _PLAYWRIGHT_OK = True
+except Exception:
+    _PLAYWRIGHT_OK = False
 
 # ---------------- Config ----------------
 HEADERS = {
@@ -39,19 +46,9 @@ ZENROWS_KEY   = os.environ.get("ZENROWS_KEY")
 
 # PSA hosts to try
 PSA_HOSTS = ["https://www.psacard.com", "https://psacard.com"]
-# Hostname set for quick checks in _fetch
-PSA_HOSTNAMES = {"www.psacard.com", "psacard.com"}
 
 # ---------------- Robust HTTPS session ----------------
 CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE+AES256:RSA+AESGCM:RSA+AES"
-
-def _mirror_url(url: str) -> str:
-    # Use r.jina.ai to fetch a read-only HTML rendering (no JS/cookies)
-    # Must pass an http:// URL path to r.jina.ai
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    # r.jina.ai wants scheme-less http target
-    return f"https://r.jina.ai/http://{p.hostname}{p.path}"
 
 class TLS12HttpAdapter(HTTPAdapter):
     """Force modern TLS + preferred ciphers to avoid handshake issues on some origins."""
@@ -91,8 +88,10 @@ def _throttle():
 
 def _proxy_wrap(url: str) -> Optional[str]:
     if SCRAPERAPI_KEY:
+        from requests.utils import quote
         return f"https://api.scraperapi.com/?api_key={SCRAPERAPI_KEY}&url={quote(url, safe='')}"
     if ZENROWS_KEY:
+        from requests.utils import quote
         return f"https://api.zenrows.com/v1/?apikey={ZENROWS_KEY}&url={quote(url, safe='')}"
     return None
 
@@ -111,18 +110,11 @@ def _fetch(
     verify_tls: bool = True,
     logger: Optional[Callable[[str], None]] = None,
 ) -> requests.Response:
-    """
-    Direct-first fetch using certifi CA; on SSLError:
-      - If host is PSA, do a single unsafe retry (verify=False) for public HTML.
-      - Then (optionally) fall back to proxy if keys are configured.
-    This preserves your original interface & logging.
-    """
     mode = "auto"
     if force_proxy is True: mode = "proxy"
     if force_proxy is False: mode = "direct"
     if logger: logger(f"GET {url}  | mode={mode}  tls_verify={'ON' if verify_tls else 'OFF'}")
 
-    # Forced proxy path unchanged
     if force_proxy is True:
         prox = _proxy_wrap(url)
         if not prox:
@@ -132,8 +124,6 @@ def _fetch(
         r.raise_for_status()
         return r
 
-    # Direct-first path
-    host = (urlparse(url).hostname or "").lower()
     try:
         r = _get(url, verify_tls=verify_tls)
         if logger: logger(f" → direct status={r.status_code}")
@@ -141,42 +131,6 @@ def _fetch(
         return r
     except requests.exceptions.SSLError as e:
         if logger: logger(f" !! SSL error on direct: {e.__class__.__name__}")
-        # PSA-only: one unsafe retry with verify=False (public HTML only)
-        if host in PSA_HOSTNAMES and verify_tls:
-            try:
-                # Use a fresh one-off request that bypasses the mounted adapter
-                r2 = requests.get(
-                    url,
-                    timeout=30,
-                    verify=False,                  # allow an unsafe retry for public HTML
-                    headers=SESSION.headers
-                )
-                if r2.ok:
-                    if logger: logger("    PSA-scoped unsafe retry succeeded")
-                    r2.raise_for_status()
-                    return r2
-                else:
-                    if logger: logger("    PSA-scoped unsafe retry failed")
-                    # Try mirror fallback on non-200 (e.g., 403)
-                    murl = _mirror_url(url)
-                    if logger: logger(f"    Mirror try: {murl}")
-                    rm = requests.get(murl, timeout=30, headers=SESSION.headers)
-                    if logger: logger(f"    Mirror status={rm.status_code}")
-                    rm.raise_for_status()
-                    return rm
-            except Exception as e2:
-                if logger: logger(f"    PSA-scoped unsafe retry error: {type(e2).__name__}")
-                # Try mirror as last resort
-                try:
-                    murl = _mirror_url(url)
-                    if logger: logger(f"    Mirror try: {murl}")
-                    rm = requests.get(murl, timeout=30, headers=SESSION.headers)
-                    if logger: logger(f"    Mirror status={rm.status_code}")
-                    rm.raise_for_status()
-                    return rm
-                except Exception as e3:
-                    if logger: logger(f"    Mirror error: {type(e3).__name__}")
-        # Optional proxy fallback if available
         if allow_proxy_fallback and force_proxy is None:
             prox = _proxy_wrap(url)
             if prox:
@@ -185,8 +139,6 @@ def _fetch(
                 rp.raise_for_status()
                 return rp
         raise
-
-
 
 # ---------------- Models ----------------
 @dataclass
@@ -392,6 +344,68 @@ def _extract_apr_url_from_cert_soup(soup: BeautifulSoup, host: str) -> Optional[
             return href
     return None
 
+# --------- Playwright-assisted APR table parser (fallback/robust) ---------
+def _apr_prices_by_grade_playwright(apr_url: str, logger: Optional[Callable[[str], None]] = None) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    Fetch the APR page with Playwright and extract the 'Auction Prices by Grade' table.
+    Returns mapping: grade_text -> {"most_recent_price": float|None, "average_price": float|None}
+    """
+    if not _PLAYWRIGHT_OK:
+        if logger: logger("   Playwright not available; cannot use fallback.")
+        return {}
+
+    if logger: logger(f"   [PW] Launching headless Chromium for APR: {apr_url}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                )
+            )
+            page = context.new_page()
+            page.goto(apr_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector("tbody.text-left.text-body1.text-primary", timeout=60000)
+            except PlaywrightTimeoutError:
+                if logger: logger("   [PW] Warning: table selector timeout, parsing whatever HTML is available.")
+            html = page.content()
+            browser.close()
+    except Exception as e:
+        if logger: logger(f"   [PW] Failed to fetch APR page: {e.__class__.__name__}: {e}")
+        return {}
+
+    soup = BeautifulSoup(html, "html.parser")
+    tbody = soup.select_one("tbody.text-left.text-body1.text-primary")
+    out: Dict[str, Dict[str, Optional[float]]] = {}
+    if not tbody:
+        return out
+
+    def _parse_price(text: str) -> Optional[float]:
+        text = (text or "").strip().replace("$", "").replace(",", "")
+        if text in ("", "-", "—"):
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+
+    for row in tbody.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 3:
+            continue
+        grade = cells[0].get_text(strip=True)
+        most_recent_raw = cells[1].get_text(strip=True)
+        average_raw = cells[2].get_text(strip=True)
+        out[grade] = {
+            "most_recent_price": _parse_price(most_recent_raw),
+            "average_price": _parse_price(average_raw),
+        }
+    if logger: logger(f"   [PW] Parsed {len(out)} APR grade rows.")
+    return out
+
 # ---------------- PSA APR fetch ----------------
 def _psa_cert_info(cert: str, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> Tuple[str, Optional[str], Optional[float]]:
     """
@@ -461,17 +475,8 @@ def _parse_most_recent_by_grade_from_apr_soup(soup: BeautifulSoup, grade_num: in
     return None
 
 def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> List[float]:
-    try:
-        r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
-        html = r.text
-    except Exception as e:
-        if logger: logger(f"   APR fetch error {type(e).__name__}; trying mirror")
-        rm = requests.get(_mirror_url(apr_url), timeout=30, headers=SESSION.headers)
-        if logger: logger(f"   APR mirror status={rm.status_code}")
-        rm.raise_for_status()
-        html = rm.text
-
-    text = BeautifulSoup(html, "lxml").get_text(" ", strip=True)
+    r = _fetch(apr_url, allow_proxy_fallback=True, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+    text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)
     hits = re.findall(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?|[0-9]+(?:\.[0-9]{2})?)', text)
     out: List[float] = []
     for h in hits[:take]:
@@ -482,7 +487,7 @@ def _psa_apr_recent_prices(apr_url: str, take: int = 25, *, force_proxy: Optiona
     if logger: logger(f"   PSA APR: collected {len(out)} recent price tokens")
     return out
 
-def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True, logger: Optional[Callable[[str], None]] = None) -> PsaComp:
+def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optional[bool] = None, verify_tls: bool = True, use_playwright_apr: bool = False, logger: Optional[Callable[[str], None]] = None) -> PsaComp:
     cert_url, apr_url, psa_estimate = _psa_cert_info(cert, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
 
     most_recent_for_grade = None
@@ -496,6 +501,17 @@ def _fetch_psa_comp(cert: str, grade_num: Optional[int], *, force_proxy: Optiona
 
         if grade_num is not None:
             most_recent_for_grade = _parse_most_recent_by_grade_from_apr_soup(soup, grade_num, logger=logger)
+
+            # If we failed to parse the Most Recent value, try Playwright fallback if enabled
+            if most_recent_for_grade is None and use_playwright_apr:
+                if logger: logger("   APR table parse failed; attempting Playwright fallback…")
+                table = _apr_prices_by_grade_playwright(apr_url, logger=logger)
+                key_variants = [f"PSA {int(float(grade_num))}", f"PSA{int(float(grade_num))}", str(int(float(grade_num)))]
+                for k in key_variants:
+                    if k in table and table[k].get("most_recent_price") is not None:
+                        most_recent_for_grade = table[k]["most_recent_price"]
+                        if logger: logger(f"   [PW] Most Recent for grade found: ${most_recent_for_grade}")
+                        break
             _throttle()
 
         # Then collect a bunch of $ amounts across the APR page (used for median fallback)
@@ -528,6 +544,7 @@ def scan_selected_categories(
     *,
     force_proxy: Optional[bool] = None,
     verify_tls: bool = True,
+    use_playwright_apr: bool = False,
     logger: Optional[Callable[[str], None]] = None
 ) -> pd.DataFrame:
     selected: Dict[str, str] = {}
@@ -558,7 +575,7 @@ def scan_selected_categories(
 
         for it in found_items:
             _throttle()
-            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls, use_playwright_apr=use_playwright_apr, logger=logger)
 
             # Choose best comp value in priority order
             comp_value = None
@@ -602,10 +619,11 @@ def test_psa_cert(
     *,
     force_proxy: Optional[bool] = None,
     verify_tls: bool = True,
+    use_playwright_apr: bool = False,
     logger: Optional[Callable[[str], None]] = None
 ) -> Dict[str, Optional[float]]:
     if logger: logger(f"[test] PSA cert {cert}  grade={grade_num or '—'}")
-    comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls, logger=logger)
+    comp = _fetch_psa_comp(cert, grade_num, force_proxy=force_proxy, verify_tls=verify_tls, use_playwright_apr=use_playwright_apr, logger=logger)
     value = None
     for v in (comp.most_recent_for_grade, comp.psa_estimate, comp.median_recent_sales):
         if v is not None:
