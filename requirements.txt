@@ -6,3 +6,4 @@ python-dateutil
 streamlit
 certifi
 urllib3
+playwright
