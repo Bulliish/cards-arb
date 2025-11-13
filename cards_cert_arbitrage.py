@@ -575,11 +575,28 @@ def scan_selected_categories(
 
         for it in found_items:
             _throttle()
-            comp = _fetch_psa_comp(it.psa_cert, it.psa_grade_num, force_proxy=force_proxy, verify_tls=verify_tls, use_playwright_apr=use_playwright_apr, logger=logger)
+            try:
+                comp = _fetch_psa_comp(
+                    it.psa_cert,
+                    it.psa_grade_num,
+                    force_proxy=force_proxy,
+                    verify_tls=verify_tls,
+                    use_playwright_apr=use_playwright_apr,
+                    logger=logger,
+                )
+            except requests.exceptions.HTTPError as e:
+                if logger:
+                    status = getattr(getattr(e, "response", None), "status_code", "unknown")
+                    logger(f"   PSA HTTP error for cert {it.psa_cert or 'unknown'} (status={status}): {e}. Skipping this card.")
+                continue
 
             # Choose best comp value in priority order
             comp_value = None
-            for v in (comp.most_recent_for_grade, comp.psa_estimate, comp.median_recent_sales):
+            for v in (
+                comp.most_recent_for_grade,
+                comp.psa_estimate,
+                comp.median_recent_sales,
+            ):
                 if v is not None:
                     comp_value = v
                     break
@@ -590,22 +607,23 @@ def scan_selected_categories(
                 expected_net = comp_value * (1 - fee_rate) - ship_out
                 roi_pct = (expected_net - it.price) / it.price * 100
 
-            rows.append({
-                "Category": label,
-                "Store": it.source,
-                "Card Name": it.card_name,
-                "Store Price": it.price,
-                "PSA Grade": it.psa_grade_text,
-                "PSA Cert": it.psa_cert,
-                "PSA Cert URL": comp.cert_url,
-                "PSA APR URL": comp.apr_url,
-                "PSA Estimate (cert page)": comp.psa_estimate,
-                "APR Most Recent (Grade)": comp.most_recent_for_grade,
-                "APR Median Recent (All)": comp.median_recent_sales,
-                "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
-                "ROI % (est)": round(roi_pct, 2) if roi_pct is not None else None,
-                "Store URL": it.url
-            })
+            rows.append(
+                {
+                    "Category": label,
+                    "Store": it.source,
+                    "Card Name": it.card_name,
+                    "Store Price": it.price,
+                    "PSA Grade": it.psa_grade_text,
+                    "PSA Cert": it.psa_cert,
+                    "PSA Cert URL": comp.cert_url,
+                    "PSA APR URL": comp.apr_url,
+                    "PSA Estimate (cert page)": comp.psa_estimate,
+                    "APR Most Recent (Grade)": comp.most_recent_for_grade,
+                    "APR Median Recent (All)": comp.median_recent_sales,
+                    "Expected Net (est)": round(expected_net, 2) if expected_net is not None else None,
+                    "ROI % (est)": round(roi_pct, 2) if roi_pct is not None else None,
+                    "Store URL": it.url,
+                })
 
     df = pd.DataFrame(rows)
     if not df.empty and "ROI % (est)" in df.columns:
